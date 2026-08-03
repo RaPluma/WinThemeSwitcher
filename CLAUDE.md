@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Primary apply path is the `IThemeManager2` COM interface (the same one the Settings UWP wraps internally) for atomic, in-process theme apply; a two-tier fallback (legacy `ShellExecute(.theme)` → registry-only DWORD toggle) handles the case where the COM interface errors. ~330 KB single-exe, signed Authenticode, no installer.
 
+Roadmap, per-version release plan, and the patch-vs-minor versioning rules live in README.md → Roadmap. Next up is v0.4.0 (manual-override preservation across wake, "Toggle theme" tray item, fail-loudly bundle).
+
 ## Source tree vs deployed binary — read first
 
 The source tree (`C:\Users\atef\Documents\Projects\WinThemeSwitcher\`) is kept for future tweaks. **The actually-running binary lives elsewhere**:
@@ -61,6 +63,17 @@ Rust toolchain is at `%USERPROFILE%\.cargo\bin\` via rustup — on the user PATH
 
 Default toolchain is `stable-x86_64-pc-windows-msvc` (MSVC Build Tools required; the GNU toolchain's bundled linker/dlltool was broken on this machine). Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. Output ~330 KB. No `build.rs` — `windows-sys` and `windows` self-link.
 
+### Test and lint
+
+```powershell
+$cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
+$manifest = "C:\Users\atef\Documents\Projects\WinThemeSwitcher\Cargo.toml"
+& $cargo test --manifest-path $manifest                                  # full suite (CI hard gate)
+& $cargo test --manifest-path $manifest riyadh                           # only tests whose name contains "riyadh"
+& $cargo fmt --manifest-path $manifest --check                           # advisory in CI
+& $cargo clippy --release --manifest-path $manifest -- -W clippy::all    # advisory in CI
+```
+
 ### Sign every release build
 
 A self-signed Authenticode cert (`CN=WinThemeSwitcher Self-Signed`, thumbprint `40E0D1EB58DAC255EB37E9D64FF34448E3D33D12`, expires 2036-04-28) lives in `Cert:\CurrentUser\My` (with private key) and `Cert:\CurrentUser\Root`. It is **not** in `TrustedPublisher` and doesn't need to be — Root membership is what makes the chain validate (`Get-AuthenticodeSignature` → `Valid`); the README's TrustedPublisher import step is for end users' prompt suppression. The pfx export documented in older revisions is **not** at the literal `%LOCALAPPDATA%\WinThemeSwitcher\signing\` path (see backup note below) — sign from the cert store instead (verified working):
@@ -78,12 +91,12 @@ This collapses the Kaspersky heuristic signal — signed builds pass without tri
 
 ### CI and releases (`.github/workflows/`)
 
-- `ci.yml` — on push/PR to main: `cargo build --release`, then `cargo test` (**hard gate**), then `cargo fmt --check` and `cargo clippy --release -- -W clippy::all`, the last two `continue-on-error` (advisory, not gates). Run them locally via the full cargo path above. Tests live in `mod tests` at the bottom of `main.rs` — pure scheduling math with fixture locations (Apia/UTC+13 regression, Riyadh baseline, Reykjavik midnight-sunset, Tromsø polar); they are timezone-independent (all instants constructed in UTC), so they pass on any machine.
+- `ci.yml` — on push/PR to main: `cargo build --release`, then `cargo test` (**hard gate**), then `cargo fmt --check` and `cargo clippy --release -- -W clippy::all`, the last two `continue-on-error` (advisory, not gates). Run them locally via the Test and lint section above. Tests live in `mod tests` at the bottom of `main.rs`: scheduling math with fixture locations (Apia/UTC+13 regression, Riyadh baseline, Reykjavik midnight-sunset, Tromsø polar), config loading (parse-error preservation, first-run defaults, empty-file self-heal, unknown-field tolerance), and a solar-altitude sanity check. All machine-independent — instants are constructed in UTC and config tests use per-test temp files — so they pass anywhere.
 - `release.yml` — on tag push `v*` (or manual dispatch): builds on GitHub runners and attaches a zip (exe + README + LICENSE + publisher `.cer`) plus the bare exe and `WinThemeSwitcher-publisher.cer` to a **prerelease**. The `.cer` is committed at the repo root (public cert only — byte-identical to the store cert's export). **CI binaries are unsigned** — the signing key exists only on this machine, so every tagged release needs a manual post-tag step: build locally from the tag, sign (section above), zip (exe + the tag's README + LICENSE + `.cer`), then replace the workflow's assets with `gh release upload <tag> <files> --clobber`. Don't skip it: v0.3.0 originally shipped unsigned CI builds because this step was missed; the assets were replaced with signed builds on 2026-07-04, so all current v0.3.0 assets verify `Valid`.
 
 ## Architecture — `src/main.rs`
 
-Single file, ~1100 lines, event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
+Single file, ~1500 lines (incl. `mod tests`), event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
 
 ### 1. Theme apply — three-tier fallback in `apply_theme`
 
