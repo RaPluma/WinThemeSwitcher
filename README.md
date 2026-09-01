@@ -150,10 +150,16 @@ Bugs that shipped in a named release. A reader auditing a version can scan this 
 
 ### Release & distribution (dependency chain, in order)
 
-1. **Harden the release process now**: add a timestamp countersignature to signing (`/tr http://timestamp.digicert.com /td SHA256` — without it, signatures die with the cert), script the build → sign → verify → upload flow so the v0.3.0 "shipped unsigned for months" failure can't recur, and stop marking every release `prerelease` (it breaks `/releases/latest` and winget automation).
+The release-pipeline hardening items that used to live as a single bullet are now broken out so each maps cleanly to the release plan above.
+
+1. **Harden the release process (in progress — split across v0.4.0 + v0.5.0):**
+   - **1a. Done in v0.4.0**: timestamp countersignature on every signed build (`/tr http://timestamp.digicert.com /td SHA256` — without it, signatures die when the cert expires in 2036). `scripts\build.ps1` produces the signed exe and deploys to `C:\Tools\…`. See the v0.4.0 row above.
+   - **1b. v0.5.0**: `scripts\release.ps1` wraps `build.ps1` + `gh release upload --clobber` + `gh release edit --prerelease=false`. A verify step re-checks `Get-AuthenticodeSignature` post-upload and gates the workflow. Replaces the manual `cargo build` → manual `gh release upload` ritual that let the v0.3.0 "shipped unsigned for months" failure recur.
+   - **1c. v0.5.0**: investigate the recurring `wake_listener_err stage=power_register code=87` (see §Foundation). Either fix or document as benign in CLAUDE.md.
+   - **1d. v0.5.0**: stop marking releases `prerelease` — the v0.4.0 release is marked prerelease because GitHub's `release.yml` defaulted to `prerelease: true`; from v0.5.0 onward, the release script sets `prerelease: false` for stable versions. Fixes `/releases/latest` and unblocks winget automation.
 2. **CA-signed releases** via [SignPath Foundation's free OSS program](https://signpath.org) — signing moves into CI, which also permanently eliminates the manual signed-asset swap. Reduces SmartScreen prompts over time via cert reputation (no cert eliminates them outright). Azure Trusted Signing is not an option: individual validation is US/Canada-only.
 3. **Submit the first CA-signed binary to Microsoft Defender** — this gates winget, whose validation pipeline runs AV scans — and to Kaspersky. Repeat only if a specific release gets flagged.
-4. **winget package** (`InstallerType: portable`), only after steps 1–2 make asset hashes final at publish time. A personal Scoop bucket may come earlier: Scoop's `persist` mechanism fits the exe-relative config model better than winget's symlink layout.
+4. **winget package** (`InstallerType: portable`), only after steps 1–2 make asset hashes final at publish time. A personal Scoop bucket may come earlier (v0.5.0 candidate): Scoop's `persist` mechanism fits the exe-relative config model better than winget's symlink layout.
 
 ### UX polish
 
