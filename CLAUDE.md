@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Primary apply path is the `IThemeManager2` COM interface (the same one the Settings UWP wraps internally) for atomic, in-process theme apply; a two-tier fallback (legacy `ShellExecute(.theme)` → registry-only DWORD toggle) handles the case where the COM interface errors. ~330 KB single-exe, signed Authenticode, no installer.
 
-Roadmap, per-version release plan, and the patch-vs-minor versioning rules live in README.md → Roadmap. Next up is v0.4.0 (manual-override preservation across wake, "Toggle theme" tray item, fail-loudly bundle).
+Roadmap, per-version release plan, and the patch-vs-minor versioning rules live in README.md → Roadmap. Next up is v0.4.1 (patch slot, currently empty — no audit findings yet) or v0.5.0 (release-pipeline automation: `scripts\release.ps1` wraps `build.ps1` + `gh release upload --clobber` + `gh release edit --prerelease=false`, plus investigation of the recurring `wake_listener_err stage=power_register code=87`). v0.4.0 shipped 2026-09-01 — see commit `5f88d4e`.
 
 ## Source tree vs deployed binary — read first
 
@@ -114,7 +114,7 @@ This collapses the Kaspersky heuristic signal — signed builds pass without tri
 
 ## Architecture — `src/main.rs`
 
-Single file, ~2250 lines (incl. `mod tests`), event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
+Single file, 2305 lines (incl. `mod tests`), event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
 
 ### 1. Theme apply — three-tier fallback in `apply_theme`
 
