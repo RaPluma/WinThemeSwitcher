@@ -19,7 +19,9 @@ use tray_icon::{
 use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows_sys::core::{GUID, HRESULT};
-use windows_sys::Win32::Foundation::{SysFreeString, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    GetLastError, SysFreeString, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -31,6 +33,7 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{SHLoadIndirectString, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW,
@@ -252,6 +255,187 @@ enum Theme {
     Dark,
 }
 
+impl Theme {
+    fn opposite(self) -> Theme {
+        match self {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+}
+
+/// Why a tick is running — decides whether an apply is forced, state-aware, or
+/// override-preserving (see `should_apply`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickKind {
+    /// First tick after launch.
+    Init,
+    /// ResumeTimeReached — a scheduled sunrise/sunset (or an apply retry).
+    Scheduled,
+    /// Session unlock / power resume.
+    Wake,
+    /// User clicked Refresh.
+    Refresh,
+}
+
+/// Per-session tick state, owned by the event-loop closure.
+struct TickState {
+    /// Next scheduled transition (UTC) recorded by the last tick that ended
+    /// reconciled — applied successfully, found the screen already matching,
+    /// or deliberately preserved an override. `now >= reconciled_next` on a
+    /// later tick means at least one transition has passed since we were
+    /// last in sync, regardless of how many were missed (a same-THEME parity
+    /// comparison would wrongly preserve an override across an ordinary
+    /// overnight lock that spans sunset AND sunrise). A FAILED apply leaves
+    /// this stale on purpose: every subsequent wake then sees the transition
+    /// as still-unreconciled and re-applies, instead of misreading the
+    /// failure as a user override.
+    reconciled_next: Option<DateTime<Utc>>,
+    /// Consecutive failed applies in the current failure episode.
+    retry_count: u32,
+    /// current_theme() observed when the last apply failed. If the screen no
+    /// longer matches this, the user intervened during the retry window and
+    /// the retry must stand down rather than clobber their choice.
+    retry_baseline: Option<Theme>,
+    /// The next-transition instant computed at the tick whose apply failed —
+    /// the failure episode's own window. An intervention only cancels the
+    /// retry while `now < episode_next`; past it, a transition has passed
+    /// and reconciling to the schedule outranks the stand-down (otherwise an
+    /// intervention right before a suspend that spans a transition would be
+    /// promoted to a day-long override).
+    episode_next: Option<DateTime<Utc>>,
+}
+
+impl TickState {
+    fn new() -> Self {
+        Self {
+            reconciled_next: None,
+            retry_count: 0,
+            retry_baseline: None,
+            episode_next: None,
+        }
+    }
+}
+
+/// What a tick decided to do — see `decide_tick`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickAction {
+    /// Call apply_theme.
+    Apply,
+    /// Screen already matches the schedule.
+    SkipInSync,
+    /// Wake tick, screen diverges, but no transition passed since the last
+    /// reconciled tick: a manual override is being preserved.
+    SkipOverride,
+    /// The user changed the theme during a pending retry window — cancel the
+    /// retry episode and let their choice stand until the next transition.
+    CancelRetry,
+}
+
+/// The tick decision, minus all I/O. Pure — unit-tested, including across
+/// sequences of ticks mutating one TickState via note_reconciled /
+/// note_apply_failed. IMPORTANT: called with the PRE-tick state; the state
+/// notes are recorded after the apply outcome is known.
+fn decide_tick(
+    kind: TickKind,
+    current: Option<Theme>,
+    target: Theme,
+    now: DateTime<Utc>,
+    state: &TickState,
+) -> TickAction {
+    // Refresh is fresh user intent: always force-apply.
+    if kind == TickKind::Refresh {
+        return TickAction::Apply;
+    }
+    // Pending-retry gate: the screen moved away from the failure snapshot,
+    // so the user intervened mid-episode. Only an OBSERVED move counts — an
+    // unreadable reading (None) on EITHER side proves nothing and must not
+    // cancel. And the stand-down only applies within the failure episode's
+    // own window (now < episode_next): once a transition has passed,
+    // reconciling to the schedule outranks it, exactly like any override
+    // ending at the next natural transition.
+    if state.retry_count > 0
+        && state.retry_baseline.is_some()
+        && current.is_some()
+        && current != state.retry_baseline
+        && state.episode_next.is_some_and(|n| now < n)
+    {
+        return TickAction::CancelRetry;
+    }
+    if current == Some(target) {
+        return TickAction::SkipInSync;
+    }
+    let transition_passed = state.reconciled_next.is_none_or(|n| now >= n);
+    // Override preservation yields to a pending retry: a wake during an
+    // active failure episode is a free retry opportunity (the divergence is
+    // the FAILURE, not an override), including episodes started mid-window
+    // by a failed Refresh where reconciled_next is still in the future.
+    if kind == TickKind::Wake && !transition_passed && state.retry_count == 0 {
+        return TickAction::SkipOverride;
+    }
+    TickAction::Apply
+}
+
+/// Record a tick that ended in sync with the schedule (any non-Err outcome).
+fn note_reconciled(state: &mut TickState, next: DateTime<Utc>) {
+    state.reconciled_next = Some(next);
+    state.retry_count = 0;
+    state.retry_baseline = None;
+    state.episode_next = None;
+}
+
+/// Record a failed apply. Returns true when a quick retry should be
+/// scheduled; false when the budget is exhausted (the episode resets so the
+/// NEXT transition window gets a fresh budget, and reconciled_next stays
+/// stale so wake events remain free retry opportunities).
+fn note_apply_failed(
+    state: &mut TickState,
+    observed: Option<Theme>,
+    next_utc: DateTime<Utc>,
+) -> bool {
+    state.retry_count += 1;
+    state.retry_baseline = observed;
+    if state.retry_count > MAX_APPLY_RETRIES {
+        state.retry_count = 0;
+        state.retry_baseline = None;
+        state.episode_next = None;
+        false
+    } else {
+        state.episode_next = Some(next_utc);
+        true
+    }
+}
+
+/// What the Toggle menu item should apply. Pure — unit-tested. An unreadable
+/// current theme (registry read failure) defaults the base to Light, so the
+/// first toggle lands on Dark.
+fn toggle_target(current: Option<Theme>) -> Theme {
+    current.unwrap_or(Theme::Light).opposite()
+}
+
+/// Keep a message single-line and parseable inside a `msg="..."` log field
+/// (inner quotes swapped to apostrophes, newlines flattened). Shared by the
+/// panic hook, fatal-error reporting, config-error reporting, and tick
+/// apply-error lines.
+fn sanitize_log_msg(s: &str) -> String {
+    s.replace('"', "'").replace(['\n', '\r'], " ")
+}
+
+/// How long after a failed apply the bounded retry fires.
+const APPLY_RETRY_DELAY_SECS: i64 = 60;
+/// Consecutive failures after which we stop retrying until the next
+/// scheduled transition.
+const MAX_APPLY_RETRIES: u32 = 3;
+
+/// Deadline for the next tick after a failed apply: retry soon, but never
+/// past the scheduled transition itself. Pure — unit-tested.
+fn retry_deadline(now: DateTime<Local>, next: DateTime<Local>) -> DateTime<Local> {
+    std::cmp::min(
+        next,
+        now + chrono::Duration::seconds(APPLY_RETRY_DELAY_SECS),
+    )
+}
+
 #[derive(Debug, Clone)]
 enum AppEvent {
     Menu(MenuId),
@@ -461,7 +645,7 @@ fn report_config_error(err: &str) {
         Local::now().to_rfc3339(),
         // serde_json errors quote the offending token; keep the log's
         // quoted-field convention parseable.
-        err.replace('"', "'"),
+        sanitize_log_msg(err),
     ));
     if CONFIG_ERROR_BOX_OPEN.swap(true, Ordering::SeqCst) {
         return;
@@ -1064,7 +1248,7 @@ fn make_tray_icon() -> Option<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).ok()
 }
 
-fn tick(cfg: &Config, elwt: &ActiveEventLoop, cause: &str, force: bool) {
+fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state: &mut TickState) {
     let now = Local::now();
     let now_str = now.to_rfc3339();
 
@@ -1074,34 +1258,77 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, cause: &str, force: bool) {
         return;
     }
 
-    let (want, next_utc) = schedule(now.with_timezone(&Utc), cfg.latitude, cfg.longitude);
+    let now_utc = now.with_timezone(&Utc);
+    let (want, next_utc) = schedule(now_utc, cfg.latitude, cfg.longitude);
     let current = current_theme();
-
-    let outcome = if force || current != Some(want) {
-        match apply_theme(want, cfg) {
-            Ok(method) => format!("applied={}", method),
-            Err(e) => format!("err=\"{}\"", e),
-        }
-    } else {
-        "applied=skip".to_string()
-    };
-
     let next = next_utc.with_timezone(&Local);
+
+    // Decide with the PRE-tick state; record the outcome after the apply
+    // result is known (a failed apply must leave reconciled_next stale — see
+    // TickState).
+    let action = decide_tick(kind, current, want, now_utc, state);
+
+    let mut retry_note = String::new();
+    let mut deadline = next;
+    let outcome = match action {
+        TickAction::Apply => {
+            if kind == TickKind::Refresh {
+                // Fresh user intent (likely a just-fixed config): a Refresh
+                // never inherits a burned retry budget.
+                state.retry_count = 0;
+                state.retry_baseline = None;
+                state.episode_next = None;
+            }
+            match apply_theme(want, cfg) {
+                Ok(method) => {
+                    note_reconciled(state, next_utc);
+                    format!("applied={}", method)
+                }
+                Err(e) => {
+                    // Bounded retry: reschedule soon instead of silently
+                    // waiting up to ~12 h for the next transition. The retry
+                    // arrives as a normal ResumeTimeReached tick; the
+                    // pending-retry gate in decide_tick stands it down if
+                    // the user changes the theme in the meantime.
+                    if note_apply_failed(state, current, next_utc) {
+                        retry_note = format!(" retry={}", state.retry_count);
+                        deadline = retry_deadline(Local::now(), next);
+                    } else {
+                        retry_note = " retry=exhausted".to_string();
+                    }
+                    format!("err=\"{}\"", sanitize_log_msg(&e.to_string()))
+                }
+            }
+        }
+        TickAction::SkipInSync => {
+            note_reconciled(state, next_utc);
+            "applied=skip".to_string()
+        }
+        TickAction::SkipOverride => {
+            note_reconciled(state, next_utc);
+            "applied=skip-override".to_string()
+        }
+        TickAction::CancelRetry => {
+            note_reconciled(state, next_utc);
+            "applied=skip-user-intervened".to_string()
+        }
+    };
 
     // Stamp at write time, not tick start — apply_theme logs detail lines
     // (theme_manager2_apply, theme_manager2_err) mid-tick, and reusing the
     // tick-start timestamp here made this summary line sort before them.
     log_event(&format!(
-        "{} cause={} current={} target={} {} next={}",
+        "{} cause={} current={} target={} {}{} next={}",
         Local::now().to_rfc3339(),
         cause,
         theme_str(current),
         theme_str(Some(want)),
         outcome,
-        next.to_rfc3339(),
+        retry_note,
+        deadline.to_rfc3339(),
     ));
 
-    elwt.set_control_flow(ControlFlow::WaitUntil(deadline_instant(next)));
+    elwt.set_control_flow(ControlFlow::WaitUntil(deadline_instant(deadline)));
 }
 
 unsafe extern "system" fn wake_window_proc(
@@ -1132,7 +1359,17 @@ fn start_wake_listener() {
             wc.lpfnWndProc = Some(wake_window_proc);
             wc.hInstance = hinstance;
             wc.lpszClassName = class_name.as_ptr();
-            RegisterClassW(&wc);
+            if RegisterClassW(&wc) == 0 {
+                // Capture immediately: Local::now()/log_event make Win32
+                // calls that clobber the thread's last error.
+                let err = GetLastError();
+                log_event(&format!(
+                    "{} wake_listener_err stage=register_class code={}",
+                    Local::now().to_rfc3339(),
+                    err,
+                ));
+                // CreateWindowExW will fail below and log; fall through.
+            }
 
             let hwnd = CreateWindowExW(
                 0,
@@ -1149,15 +1386,54 @@ fn start_wake_listener() {
                 ptr::null(),
             );
             if (hwnd as usize) == 0 {
+                let err = GetLastError();
+                log_event(&format!(
+                    "{} wake_listener_err stage=create_window code={}",
+                    Local::now().to_rfc3339(),
+                    err,
+                ));
                 return;
             }
-            WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+            // Failures below degrade wake coverage (unlock or resume events
+            // won't arrive) but don't kill the listener thread — log each so
+            // a missing wake-tick has a diagnosable trace instead of silence.
+            //
+            // WTSRegisterSessionNotification depends on the terminal-services
+            // machinery, which may not be up yet when we auto-start at logon
+            // via HKCU\Run — retry briefly before settling for the log line.
+            for attempt in 1..=3 {
+                if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != 0 {
+                    if attempt > 1 {
+                        log_event(&format!(
+                            "{} wake_listener_wts_ok attempt={}",
+                            Local::now().to_rfc3339(),
+                            attempt,
+                        ));
+                    }
+                    break;
+                }
+                let err = GetLastError();
+                log_event(&format!(
+                    "{} wake_listener_err stage=wts_register attempt={} code={}",
+                    Local::now().to_rfc3339(),
+                    attempt,
+                    err,
+                ));
+                std::thread::sleep(Duration::from_secs(2));
+            }
             let mut handle = ptr::null_mut();
-            PowerRegisterSuspendResumeNotification(
+            let power_rc = PowerRegisterSuspendResumeNotification(
                 DEVICE_NOTIFY_WINDOW_HANDLE,
                 hwnd as _,
                 &mut handle,
             );
+            if power_rc != 0 {
+                log_event(&format!(
+                    "{} wake_listener_err stage=power_register code={}",
+                    Local::now().to_rfc3339(),
+                    power_rc,
+                ));
+            }
 
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
@@ -1168,7 +1444,89 @@ fn start_wake_listener() {
     });
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// Install a panic hook that leaves a trace in events.log. With
+/// `panic = "abort"` and the windowed subsystem, an unhooked panic is a
+/// zero-trace process death.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        // location() is compile-time data (survives strip = true) and often
+        // the only actionable part; payload_as_str covers &str and String
+        // panics, which is all this codebase produces.
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let msg = info.payload_as_str().unwrap_or("<non-string panic>");
+        log_event(&format!(
+            "{} panic at={} msg=\"{}\"",
+            Local::now().to_rfc3339(),
+            at,
+            sanitize_log_msg(msg),
+        ));
+    }));
+}
+
+/// Claim the per-session single-instance mutex. Returns false when another
+/// instance already holds it. The handle is intentionally leaked — it must
+/// live exactly as long as the process.
+fn claim_single_instance() -> bool {
+    let name = wide("Local\\WinThemeSwitcher.single-instance");
+    unsafe {
+        let handle = CreateMutexW(ptr::null(), 0, name.as_ptr());
+        let last = GetLastError();
+        if (handle as usize) != 0 && last == ERROR_ALREADY_EXISTS {
+            // Second instance; the OS closes the extra handle at process exit.
+            return false;
+        }
+        if (handle as usize) == 0 {
+            // Failing to create the mutex is no reason to refuse to run.
+            log_event(&format!(
+                "{} single_instance_err code={}",
+                Local::now().to_rfc3339(),
+                last,
+            ));
+        }
+        true
+    }
+}
+
+fn main() {
+    install_panic_hook();
+    if !claim_single_instance() {
+        log_event(&format!(
+            "{} duplicate_instance action=exit",
+            Local::now().to_rfc3339(),
+        ));
+        show_message_box(
+            "WinThemeSwitcher",
+            "WinThemeSwitcher is already running — look for its icon in the \
+             notification area.",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        std::process::exit(0);
+    }
+    if let Err(e) = run() {
+        // Fail loudly: tray creation racing the taskbar at login, event-loop
+        // build errors, and event-loop death all used to be silent exits.
+        let msg = sanitize_log_msg(&e.to_string());
+        log_event(&format!(
+            "{} fatal_error msg=\"{}\"",
+            Local::now().to_rfc3339(),
+            msg,
+        ));
+        show_message_box(
+            "WinThemeSwitcher — Error",
+            &format!(
+                "WinThemeSwitcher stopped because of an error:\n\n{e}\n\n\
+                 See events.log next to the exe for details."
+            ),
+            MB_OK | MB_ICONWARNING,
+        );
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     ensure_com_initialized();
 
     // On a broken config file the session runs read-only against it: theme
@@ -1202,10 +1560,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     start_wake_listener();
 
     let tray_menu = Menu::new();
+    let toggle_i = MenuItem::new("Toggle Theme", true, None);
     let open_cfg_i = MenuItem::new("Open Config", true, None);
     let refresh_i = MenuItem::new("Refresh", true, None);
     let quit_i = MenuItem::new("Quit", true, None);
     tray_menu.append_items(&[
+        &toggle_i,
         &open_cfg_i,
         &refresh_i,
         &PredefinedMenuItem::separator(),
@@ -1224,27 +1584,53 @@ fn main() -> Result<(), Box<dyn Error>> {
         let _ = proxy.send_event(AppEvent::Menu(event.id));
     }));
 
+    let toggle_id = toggle_i.id().clone();
     let open_cfg_id = open_cfg_i.id().clone();
     let refresh_id = refresh_i.id().clone();
     let quit_id = quit_i.id().clone();
 
+    let mut state = TickState::new();
+
     event_loop.run(move |event, elwt| match event {
-        Event::NewEvents(StartCause::Init) => tick(&cfg, elwt, "init", false),
+        Event::NewEvents(StartCause::Init) => tick(&cfg, elwt, TickKind::Init, "init", &mut state),
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-            tick(&cfg, elwt, "resume-time", false);
+            tick(&cfg, elwt, TickKind::Scheduled, "resume-time", &mut state);
         }
         Event::UserEvent(AppEvent::Wake(kind)) => {
             let cause = match kind {
                 WakeKind::Unlock => "wake-unlock",
                 WakeKind::Power => "wake-power",
             };
-            tick(&cfg, elwt, cause, false);
+            tick(&cfg, elwt, TickKind::Wake, cause, &mut state);
         }
         Event::UserEvent(AppEvent::Menu(id)) => {
             if id == quit_id {
                 elwt.exit();
             } else if id == open_cfg_id {
                 open_config_in_editor();
+            } else if id == toggle_id {
+                // A deliberate manual override: applies the opposite theme
+                // and intentionally does NOT tick, touch TickState (it
+                // tracks reconciliation with the schedule, not the screen),
+                // or disturb the pending WaitUntil — so the override
+                // survives lock/unlock (see decide_tick) and resets at the
+                // next natural transition, exactly like an override made in
+                // Settings. If a failed-apply retry is pending, the toggled
+                // theme diverges from the retry baseline and the
+                // pending-retry gate stands the retry down.
+                let before = current_theme();
+                let target = toggle_target(before);
+                let outcome = match apply_theme(target, &cfg) {
+                    Ok(method) => format!("applied={}", method),
+                    Err(e) => format!("err=\"{}\"", sanitize_log_msg(&e.to_string())),
+                };
+                log_event(&format!(
+                    "{} cause=toggle current={} target={} {}",
+                    Local::now().to_rfc3339(),
+                    theme_str(before),
+                    theme_str(Some(target)),
+                    outcome,
+                ));
             } else if id == refresh_id {
                 match load_config_at(&config_path()) {
                     Ok(new_cfg) => {
@@ -1265,7 +1651,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // the (possibly last-known-good) config is the documented
                 // recovery path when e.g. an AV quarantine deletes it.
                 let _ = set_auto_start(cfg.auto_start);
-                tick(&cfg, elwt, "refresh", true);
+                tick(&cfg, elwt, TickKind::Refresh, "refresh", &mut state);
             }
         }
         _ => {}
@@ -1502,5 +1888,418 @@ mod tests {
         );
         // Tromsø, June, near local solar midnight: midnight sun stays up (~3°).
         assert!(solar_altitude_deg(utc(2026, 6, 20, 22, 45, 0), TROMSO.0, TROMSO.1) > 0.0);
+    }
+
+    // --- tick decision: manual-override preservation (v0.4.0) ---
+
+    /// A reconciled state whose recorded next transition is at `next`.
+    fn reconciled_at(next: DateTime<Utc>) -> TickState {
+        let mut s = TickState::new();
+        note_reconciled(&mut s, next);
+        s
+    }
+
+    #[test]
+    fn refresh_forces_even_when_matching() {
+        // Refresh force-applies so config edits take effect immediately —
+        // CLAUDE.md invariant. Must beat the in-sync skip.
+        let s = reconciled_at(utc(2026, 7, 4, 15, 46, 5));
+        let now = utc(2026, 7, 4, 9, 0, 0);
+        assert_eq!(
+            decide_tick(TickKind::Refresh, Some(Theme::Light), Theme::Light, now, &s),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn matching_current_skips_apply() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let now = utc(2026, 7, 4, 9, 0, 0);
+        let s = reconciled_at(sunset);
+        for kind in [TickKind::Init, TickKind::Scheduled, TickKind::Wake] {
+            assert_eq!(
+                decide_tick(kind, Some(Theme::Light), Theme::Light, now, &s),
+                TickAction::SkipInSync,
+                "kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_transition_applies_over_override() {
+        // A natural transition resets any manual override — documented
+        // behavior. The sunset tick fires at/after the recorded next.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        assert_eq!(
+            decide_tick(
+                TickKind::Scheduled,
+                Some(Theme::Light),
+                Theme::Dark,
+                sunset,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn wake_before_next_transition_preserves_override() {
+        // Mid-day the user picked Dark (schedule says Light until sunset).
+        // Win+L → unlock before sunset: no transition passed → override
+        // survives.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        let now = utc(2026, 7, 4, 12, 0, 0);
+        assert_eq!(
+            decide_tick(TickKind::Wake, Some(Theme::Dark), Theme::Light, now, &s),
+            TickAction::SkipOverride
+        );
+    }
+
+    #[test]
+    fn wake_after_missed_transition_reconciles() {
+        // Slept through sunset: now >= recorded next → reconcile.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        let now = utc(2026, 7, 4, 20, 0, 0);
+        assert_eq!(
+            decide_tick(TickKind::Wake, Some(Theme::Light), Theme::Dark, now, &s),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn wake_after_even_number_of_missed_transitions_reconciles() {
+        // Overnight lock spanning sunset AND sunrise: the schedule's target
+        // is back to Light — same THEME as when we reconciled, but two
+        // transitions passed. A parity comparison of themes would wrongly
+        // preserve yesterday's override; the time rule must reconcile.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        let next_morning = utc(2026, 7, 5, 4, 0, 0);
+        assert_eq!(
+            decide_tick(
+                TickKind::Wake,
+                Some(Theme::Dark), // yesterday's override, still on screen
+                Theme::Light,
+                next_morning,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn wake_without_baseline_reconciles() {
+        // A wake before any reconciled tick (e.g. Init hit the no-location
+        // path): the safe default is reconcile, not preserve.
+        let s = TickState::new();
+        let now = utc(2026, 7, 4, 12, 0, 0);
+        assert_eq!(
+            decide_tick(TickKind::Wake, Some(Theme::Dark), Theme::Light, now, &s),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn wake_with_unreadable_current_skips_inside_window() {
+        // current_theme() = None (registry read failed): inside a preserved
+        // window the app declines to apply — pinned deliberately.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        let now = utc(2026, 7, 4, 12, 0, 0);
+        assert_eq!(
+            decide_tick(TickKind::Wake, None, Theme::Light, now, &s),
+            TickAction::SkipOverride
+        );
+    }
+
+    #[test]
+    fn theme_opposite_flips() {
+        assert_eq!(Theme::Light.opposite(), Theme::Dark);
+        assert_eq!(Theme::Dark.opposite(), Theme::Light);
+    }
+
+    #[test]
+    fn toggle_target_flips_current_and_defaults_dark() {
+        assert_eq!(toggle_target(Some(Theme::Light)), Theme::Dark);
+        assert_eq!(toggle_target(Some(Theme::Dark)), Theme::Light);
+        // Unreadable current: base defaults to Light → toggle lands on Dark.
+        assert_eq!(toggle_target(None), Theme::Dark);
+    }
+
+    #[test]
+    fn sanitize_log_msg_keeps_field_parseable() {
+        assert_eq!(
+            sanitize_log_msg("bad \"path\" at\nline\r\ntwo"),
+            "bad 'path' at line  two"
+        );
+    }
+
+    // --- bounded apply retry (v0.4.0) ---
+
+    #[test]
+    fn retry_deadline_is_soon_but_never_past_next_transition() {
+        let now = utc(2026, 7, 4, 9, 0, 0).with_timezone(&Local);
+        let far_next = utc(2026, 7, 4, 15, 0, 0).with_timezone(&Local);
+        let near_next = utc(2026, 7, 4, 9, 0, 30).with_timezone(&Local);
+        assert_eq!(
+            retry_deadline(now, far_next),
+            now + chrono::Duration::seconds(APPLY_RETRY_DELAY_SECS)
+        );
+        assert_eq!(retry_deadline(now, near_next), near_next);
+    }
+
+    #[test]
+    fn failed_apply_then_wake_must_reapply_not_preserve() {
+        // THE design-review blocker: a failed apply must never be mistaken
+        // for a user override. Sequence: noon tick reconciles; sunset passes
+        // while asleep; resume tick's apply FAILS; seconds later the unlock
+        // wake fires — it must Apply (acting as a free retry), not skip.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        let resume_at = utc(2026, 7, 4, 17, 0, 0);
+        assert_eq!(
+            decide_tick(
+                TickKind::Wake,
+                Some(Theme::Light),
+                Theme::Dark,
+                resume_at,
+                &s
+            ),
+            TickAction::Apply
+        );
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        let unlock_at = utc(2026, 7, 4, 17, 0, 10);
+        assert_eq!(
+            decide_tick(
+                TickKind::Wake,
+                Some(Theme::Light),
+                Theme::Dark,
+                unlock_at,
+                &s
+            ),
+            TickAction::Apply,
+            "wake after failed apply must re-apply, not preserve the failure"
+        );
+    }
+
+    #[test]
+    fn user_intervention_during_retry_window_stands_down() {
+        // Sunset apply fails (screen stuck Light); the user then explicitly
+        // picks a theme. The pending retry must cancel instead of clobbering
+        // their choice — and afterwards the override survives normally.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        // User toggles to Dark (matches schedule — converged) or picks Light
+        // again in Settings; either way the observed theme moved off the
+        // failure baseline. Here: user picked Dark, so current == target.
+        let retry_at = utc(2026, 7, 4, 16, 47, 5);
+        assert_eq!(
+            decide_tick(
+                TickKind::Scheduled,
+                Some(Theme::Dark),
+                Theme::Dark,
+                retry_at,
+                &s
+            ),
+            TickAction::CancelRetry
+        );
+        note_reconciled(&mut s, utc(2026, 7, 5, 2, 35, 0));
+        assert_eq!(s.retry_count, 0);
+    }
+
+    #[test]
+    fn unreadable_current_does_not_cancel_retry() {
+        // None proves nothing about user intent — the retry must proceed.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        let retry_at = utc(2026, 7, 4, 16, 47, 5);
+        assert_eq!(
+            decide_tick(TickKind::Scheduled, None, Theme::Dark, retry_at, &s),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn retry_budget_is_bounded_and_resets_per_episode() {
+        let mut s = TickState::new();
+        // Three failures schedule retries; the fourth gives up AND resets,
+        // so the next transition window gets a fresh budget instead of
+        // inheriting a permanently burned one.
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        assert!(!note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        assert_eq!(s.retry_count, 0);
+        assert_eq!(s.retry_baseline, None);
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+    }
+
+    #[test]
+    fn reconcile_clears_retry_episode() {
+        let next = utc(2026, 7, 5, 2, 35, 0);
+        let mut s = TickState::new();
+        assert!(note_apply_failed(&mut s, Some(Theme::Light), next));
+        note_reconciled(&mut s, next);
+        assert_eq!(s.retry_count, 0);
+        assert_eq!(s.retry_baseline, None);
+        assert_eq!(s.reconciled_next, Some(next));
+    }
+
+    // --- .theme DisplayName resolution (v0.4.0) ---
+
+    /// Temp .theme file that cleans up after itself; same uniqueness contract
+    /// as TempConfig (distinct `name` per test).
+    struct TempTheme(PathBuf);
+
+    impl TempTheme {
+        fn new(name: &str, bytes: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "wts-test-{}-{}.theme",
+                std::process::id(),
+                name
+            ));
+            fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempTheme {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn theme_display_name_literal() {
+        let t = TempTheme::new(
+            "literal",
+            b"; comment\r\n[Theme]\r\nDisplayName=My Custom Theme\r\nColor=1\r\n",
+        );
+        assert_eq!(
+            resolve_theme_display_name(&t.0).as_deref(),
+            Some("My Custom Theme")
+        );
+    }
+
+    #[test]
+    fn theme_display_name_only_read_from_theme_section() {
+        let t = TempTheme::new(
+            "wrong-section",
+            b"[Control Panel\\Desktop]\r\nDisplayName=Nope\r\n[Slideshow]\r\nInterval=1\r\n",
+        );
+        assert_eq!(resolve_theme_display_name(&t.0), None);
+    }
+
+    #[test]
+    fn theme_display_name_section_header_case_insensitive() {
+        let t = TempTheme::new("case", b"[THEME]\r\nDisplayName=Loud\r\n");
+        assert_eq!(resolve_theme_display_name(&t.0).as_deref(), Some("Loud"));
+    }
+
+    #[test]
+    fn theme_display_name_survives_windows_1252_comment_bytes() {
+        // aero.theme's copyright comment carries a raw 0xa9 (©) — invalid
+        // UTF-8. The lossy decode + comment skipping must not derail parsing.
+        let t = TempTheme::new(
+            "cp1252",
+            b"; Copyright \xa9 Microsoft\r\n[Theme]\r\nDisplayName=Real\r\n",
+        );
+        assert_eq!(resolve_theme_display_name(&t.0).as_deref(), Some("Real"));
+    }
+
+    #[test]
+    fn theme_display_name_missing_file_or_key_is_none() {
+        let missing =
+            std::env::temp_dir().join(format!("wts-test-{}-nonexistent.theme", std::process::id()));
+        assert_eq!(resolve_theme_display_name(&missing), None);
+        let t = TempTheme::new("no-name", b"[Theme]\r\nColor=1\r\n");
+        assert_eq!(resolve_theme_display_name(&t.0), None);
+    }
+
+    #[test]
+    fn system_theme_display_names_resolve_via_indirect_strings() {
+        // Guarded: meaningful anywhere the stock themes exist (any normal
+        // Windows, incl. GitHub windows-latest runners). Exercises the
+        // SHLoadIndirectString path used for tier-1 apply of system themes.
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let aero = PathBuf::from(&root).join("Resources\\Themes\\aero.theme");
+        let dark = PathBuf::from(&root).join("Resources\\Themes\\dark.theme");
+        if !aero.exists() || !dark.exists() {
+            // Rust has no test-skip; make the silent pass greppable so a
+            // runner without stock themes doesn't hide that this is the only
+            // coverage of resolve_indirect_string.
+            eprintln!("SKIP: system .theme files absent — indirect-string path not exercised");
+            return;
+        }
+        let a = resolve_theme_display_name(&aero).expect("aero.theme display name");
+        let d = resolve_theme_display_name(&dark).expect("dark.theme display name");
+        assert!(!a.is_empty() && !d.is_empty());
+        assert_ne!(a, d);
+    }
+
+    // --- resolve_theme_file fallback chain (v0.4.0) ---
+
+    #[test]
+    fn theme_file_custom_path_wins_when_present() {
+        let t = TempTheme::new("custom-day", b"[Theme]\r\nDisplayName=Custom\r\n");
+        let cfg = Config {
+            theme_day: Some(t.0.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        assert_eq!(resolve_theme_file(Theme::Light, &cfg), t.0);
+    }
+
+    #[test]
+    fn theme_file_falls_back_when_custom_path_missing() {
+        let cfg = Config {
+            theme_night: Some("C:\\definitely\\not\\here.theme".into()),
+            ..Config::default()
+        };
+        let p = resolve_theme_file(Theme::Dark, &cfg);
+        assert!(p.ends_with("dark.theme"), "got {p:?}");
+    }
+
+    #[test]
+    fn theme_file_defaults_by_theme() {
+        let cfg = Config::default();
+        assert!(resolve_theme_file(Theme::Light, &cfg).ends_with("aero.theme"));
+        assert!(resolve_theme_file(Theme::Dark, &cfg).ends_with("dark.theme"));
     }
 }

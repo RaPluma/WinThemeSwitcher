@@ -9,7 +9,8 @@ Automatically swap between two Windows 11 **themes** at local sunrise and sunset
 - **Tiny binary** (~330 KB), zero CPU between transitions — event-driven, sleeps on a kernel timer until the next sunrise/sunset or a tray click.
 - **Reliable theme apply** via the `IThemeManager2` COM interface — the same API the Settings UWP wraps internally. Atomic, in-process, ~200 ms latency, no Settings flash. Two-tier fallback if it ever errors.
 - **Catches up after sleep / lock.** A scheduled sunrise that fires while you're suspended reconciles the moment you log back in.
-- **Respects manual overrides** — changing theme in Settings sticks until the next natural transition; the app won't fight ambient setting-change broadcasts. Known gap: a lock/unlock or wake-from-sleep currently snaps back to the schedule (fix on the [Roadmap](#roadmap)).
+- **Respects manual overrides** — changing theme in Settings (or via the tray's **Toggle Theme**) sticks until the next natural sunrise/sunset transition, surviving lock/unlock and sleep/resume. The app only steps in when a transition actually passed while you were away.
+- **Recovers from failed applies** — a transition whose apply errors is retried up to 3 times a minute apart (instead of silently waiting for the next transition), and stands down if you change the theme yourself in the meantime.
 - **Diagnostic log** at `events.log` next to the exe (rotated past 256 KB) — every transition recorded with cause, target, applied tier, and timing.
 
 ## Install
@@ -51,9 +52,12 @@ After editing config, right-click tray → **Refresh**. No restart needed.
 
 ## Tray menu
 
+- **Toggle Theme** — flips light/dark right now, as a manual override: it sticks (including across lock/unlock and sleep) until the next natural sunrise/sunset transition.
 - **Open Config** — opens `config.json` in your default editor.
 - **Refresh** — re-reads config, retries Windows Location if needed, force-applies the correct theme.
 - **Quit** — exits. The auto-start entry persists; set `auto_start: false` and click Refresh (or relaunch) once to remove it.
+
+If two copies are launched, the second shows a notice and exits (single-instance). Fatal startup errors show a dialog and are recorded in `events.log`, as are panics.
 
 ## Verifying the signature
 
@@ -111,7 +115,7 @@ No installer, no uninstaller — it's a single-exe tool by design.
 
 ## Roadmap
 
-Ordered by priority. The correctness items come first — they are confirmed bugs in the shipped code (July 2026 audit), not features.
+Ordered by priority. The July 2026 audit's confirmed correctness bugs shipped as fixes in v0.3.x–v0.4.0; release/distribution work is next.
 
 ### Release plan
 
@@ -120,7 +124,7 @@ Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **mi
 | Version | Type | Contents |
 |---|---|---|
 | **v0.3.2** | patch | **Shipped 2026-07-04.** Sunrise/sunset day-bracketing fix + scheduling tests + CI gate; `config.json` never overwritten on a parse error (error is logged + shown in a non-blocking dialog, empty file self-heals, autostart setting survives a broken file) |
-| **v0.4.0** | minor | Preserve manual overrides across lock/unlock/resume (changes documented behavior); "Toggle theme" tray item; fail-loudly bundle (panic hook, startup MessageBox, wake-listener logging, single-instance mutex, bounded apply retry); remaining unit tests (config parsing, `.theme`-name resolution) |
+| **v0.4.0** | minor | **Shipped 2026-08-03.** Preserve manual overrides across lock/unlock/resume (time-based reconciliation — overrides survive any-length sleeps; missed transitions still reconcile); "Toggle Theme" tray item; fail-loudly bundle (panic hook, fatal-error MessageBox, wake-listener logging + WTS registration retry, single-instance mutex, bounded apply retry with user-intervention stand-down); `.theme`-name resolution + tick-decision unit tests (40 total); signed-test-binary script (`scripts\test.ps1`) |
 | **v0.5.0** | minor | Scripted build → sign → verify → upload; first release not marked prerelease (fixes `/releases/latest`); candidate point to launch the Scoop bucket |
 | **v0.6.0** | minor | SignPath CA signing in CI (ends the manual signed-asset swap); submit the first CA-signed binary to Defender + Kaspersky |
 | **v0.7.0** | minor | Live tray tooltip; "Open Log" menu item; Refresh-failure MessageBox; first-run location retry; `offset_sunrise_min` / `offset_sunset_min` |
@@ -128,12 +132,11 @@ Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **mi
 
 ### Correctness fixes
 
-- **Preserve manual overrides across lock/unlock and resume.** A theme picked manually in Settings is currently snapped back to schedule on the next Win+L unlock or wake-from-sleep. Fix: track the last *scheduled* target on every tick and skip the wake-time re-apply when it hasn't changed (missed transitions still reconcile). Once that lands, add a **"Toggle theme" tray item** — an action, not GUI configuration.
+*(none known — the v0.4.0 items shipped; this section intentionally left empty until the next audit)*
 
 ### Foundation
 
-- **Extend the unit tests.** The scheduling math (UTC+13, polar, and midnight-sunset fixtures) and config loading (parse-error preservation, first-run, empty-file heal) are covered, and `cargo test` is a hard CI gate since 2026-07-04. Still to cover: `.theme`-name resolution. Replaces the old "manual test matrix" item: Windows 10 hit end-of-support in Oct 2025, and the multi-monitor/HiDPI surface is one 32×32 tray icon.
-- **Fail loudly instead of silently.** A panic hook that writes to `events.log` before abort (`panic = "abort"` + windowed subsystem currently means zero-trace death), a MessageBox + log line when startup fails (e.g. tray creation racing the taskbar at login), logging on wake-listener registration failures, a single-instance mutex, and a bounded retry when a theme apply fails (today the next attempt can be ~12 h away).
+- **Remaining known gaps** (accepted for now, documented in CLAUDE.md): the bounded apply retry covers total apply failure only — a tier-2 `ShellExecute` silent-fail is still recovered by `commit_watcher`'s registry fallback, not the retry counter; and a Toggle within ~5 s of a tier-2 apply can be reverted by that apply's still-running commit watcher (unreachable while tier 1 is healthy).
 
 ### Release & distribution (dependency chain, in order)
 

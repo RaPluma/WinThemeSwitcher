@@ -34,6 +34,8 @@ Start-Process "C:\Tools\WinThemeSwitcher\win-theme-switcher.exe"
 
 **Resolved as of the IThemeManager2 + code-signing migration** — both root causes of the AV friction were addressed simultaneously. The signed binary (`CN=WinThemeSwitcher Self-Signed` cert trusted via `Cert:\CurrentUser\Root`) collapses the Authenticode-trust signal, and tier-1 theme apply via `IThemeManager2::SetCurrentTheme` removes the `HWND_BROADCAST WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` signals that previously tripped behavior heuristics. **Sign every release build** (see Build section below) — unsigned builds will resurrect the issue. Everything below is preserved as historical context for unsigned-build scenarios; the current signed build should not need any of it.
 
+**Dev/test builds (2026-08-03):** KSN flagged fresh unsigned *test* binaries in `target\debug\deps\` (`VHO:Trojan.Win32.Convagent.gen`) — the trust rules above are path-based and don't cover them, and KSN's scanner locks each fresh exe faster than a post-build signtool can run. Two-layer fix now in place: (1) a Kaspersky **exclusion on the whole `target\` folder** (Settings → Security settings → Threats and Exclusions → Manage exclusions), added by the user; (2) `scripts\test.ps1` builds the test binary, signs it from the cert store, and only then executes it — **run tests via this script, not bare `cargo test`**, so the first execution KSN ever sees carries a valid signature.
+
 ### Historical: pre-signing trust setup
 
 The unsigned binary tripped `VHO:Trojan.Win32.Agent.gen` (Rust exe with no Authenticode signature + `HKCU\Run` writes + `HWND_BROADCAST` of `WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` to `Shell_TrayWnd` + WinRT Geolocation = every AV heuristic signal). Plain **path-based exclusions were insufficient** — Kaspersky's Behavior Detection quarantined regardless. The pre-signing workaround was a **Trusted Applications rule** (Kaspersky Settings → Security → Threats and Exclusions → Specify trusted applications) with all checkboxes ticked: Do not scan opened files, Do not monitor application activity, Do not inherit restrictions, Do not monitor child application activity, Allow interaction with Kaspersky interface.
@@ -54,7 +56,14 @@ The reliable workaround for a deploy session is to **right-click the tray K → 
 
 ## Build
 
-Rust toolchain is at `%USERPROFILE%\.cargo\bin\` via rustup — on the user PATH, so plain `cargo` resolves in a normal shell; the full path is kept here for shell-agnostic robustness:
+**Always build via `scripts\build.ps1`** — it produces, Authenticode-signs (with an RFC 3161 DigiCert timestamp), and deploys the release exe in one step. Bare `cargo build --release` produces a fresh-hash unsigned Windows PE; KSN flags first-seen unsigned exes with `VHO:Trojan.Win32.Convagent.gen` on this machine, and the only fix is signing before the binary ever executes. The same caveat applies to `cargo test` — use `scripts\test.ps1` (see Test section below).
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\atef\Documents\Projects\WinThemeSwitcher\scripts\build.ps1"            # build + sign + deploy
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\atef\Documents\Projects\WinThemeSwitcher\scripts\build.ps1" -SkipCopy   # build + sign only, leave C:\Tools\ untouched
+```
+
+For raw cargo (debugging a compile error only — never produces a deployable exe):
 
 ```powershell
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" build --release `
@@ -63,20 +72,29 @@ Rust toolchain is at `%USERPROFILE%\.cargo\bin\` via rustup — on the user PATH
 
 Default toolchain is `stable-x86_64-pc-windows-msvc` (MSVC Build Tools required; the GNU toolchain's bundled linker/dlltool was broken on this machine). Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. Output ~330 KB. No `build.rs` — `windows-sys` and `windows` self-link.
 
+> **For Claude Code / Fable 5 / any LLM coding agent working in this repo**: do not invoke `cargo build` or `cargo test` directly. Always call `scripts\build.ps1` (for a release) or `scripts\test.ps1` (for tests). The wrappers exist *because* agents forget to sign.
+
 ### Test and lint
+
+**On this machine, run the suite via the signing wrapper** (bare `cargo test` produces an unsigned fresh-hash exe that Kaspersky/KSN may lock or quarantine — see the Kaspersky section):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\atef\Documents\Projects\WinThemeSwitcher\scripts\test.ps1"           # full suite
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\atef\Documents\Projects\WinThemeSwitcher\scripts\test.ps1" riyadh    # name filter
+```
+
+Lint (advisory in CI):
 
 ```powershell
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 $manifest = "C:\Users\atef\Documents\Projects\WinThemeSwitcher\Cargo.toml"
-& $cargo test --manifest-path $manifest                                  # full suite (CI hard gate)
-& $cargo test --manifest-path $manifest riyadh                           # only tests whose name contains "riyadh"
-& $cargo fmt --manifest-path $manifest --check                           # advisory in CI
-& $cargo clippy --release --manifest-path $manifest -- -W clippy::all    # advisory in CI
+& $cargo fmt --manifest-path $manifest --check
+& $cargo clippy --release --manifest-path $manifest -- -W clippy::all
 ```
 
 ### Sign every release build
 
-A self-signed Authenticode cert (`CN=WinThemeSwitcher Self-Signed`, thumbprint `40E0D1EB58DAC255EB37E9D64FF34448E3D33D12`, expires 2036-04-28) lives in `Cert:\CurrentUser\My` (with private key) and `Cert:\CurrentUser\Root`. It is **not** in `TrustedPublisher` and doesn't need to be — Root membership is what makes the chain validate (`Get-AuthenticodeSignature` → `Valid`); the README's TrustedPublisher import step is for end users' prompt suppression. The pfx export documented in older revisions is **not** at the literal `%LOCALAPPDATA%\WinThemeSwitcher\signing\` path (see backup note below) — sign from the cert store instead (verified working):
+Done automatically by `scripts\build.ps1` (see Build section above). Manual sign — for rebuilding a tagged release's assets or troubleshooting — uses the cert from the store:
 
 ```powershell
 & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
@@ -96,7 +114,7 @@ This collapses the Kaspersky heuristic signal — signed builds pass without tri
 
 ## Architecture — `src/main.rs`
 
-Single file, ~1500 lines (incl. `mod tests`), event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
+Single file, ~2250 lines (incl. `mod tests`), event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
 
 ### 1. Theme apply — three-tier fallback in `apply_theme`
 
@@ -143,7 +161,7 @@ The run closure must **not** call `tick()` on every event. An earlier version di
 
 Everything else is `_ => {}` (the Menu arm also handles Open Config and Quit, which don't tick). This matches macOS behavior: manual overrides persist until the next natural transition. `ControlFlow::WaitUntil(deadline)` is set once per tick and sticks across unrelated events (no need to re-set on WaitCancelled).
 
-**State-aware apply**: `tick` calls `apply_theme` only if `current_theme() != target`. **Refresh bypasses this check** and always force-applies — needed so config edits (e.g., user points `theme_night` at a new file) take effect without waiting for the next transition.
+**State-aware apply**: `tick` decides via the pure `decide_tick(kind, current, target, now, &TickState)` → `Apply` / `SkipInSync` / `SkipOverride` / `CancelRetry`, called with the **pre-tick** state; outcomes are recorded after the apply result is known (`note_reconciled` on any non-Err outcome, `note_apply_failed` on Err). **Refresh always applies** (config edits take effect immediately) and resets the retry budget first. **Bounded apply retry (v0.4.0)**: a failed apply reschedules the WaitUntil to `min(next_transition, now + 60 s)` for up to 3 consecutive attempts (log field ` retry=N`, then ` retry=exhausted`; budget resets per episode). The retry arrives as a normal ResumeTimeReached tick; `retry_baseline` (the theme observed at failure) gates it — if the screen moved off the baseline, the user intervened and the retry stands down (`applied=skip-user-intervened`). Note the retry only covers *total* apply failure (all three tiers, realistically a failed registry write); a tier-2 ShellExecute silent-fail still recovers via commit_watcher's registry fallback, not the retry counter.
 
 Scheduling math: `schedule(now_utc) -> (Theme, next_utc)` is the single source of truth (rewritten 2026-07-04; unit-tested in `mod tests`). It collects sunrise/sunset instants for the **UTC** dates D−1..D+1 via the `sun-times` crate, sorts them as instants, and picks state-after-last-event ≤ now / first-event > now. **Never pass a local date to `sun_times`** — it takes a UTC date and keys events to the solar day; the old code did exactly that, which made UTC+13/+14 locales permanently dark and skipped post-midnight sunsets (Reykjavik in June). When the ±1-day window is empty (polar day/night), current state comes from `solar_altitude_deg` (local implementation — the crate's `altitude` has math bugs) vs. the −0.833° civil threshold, and the next transition from a ≤200-day forward scan (covers the poles' ~6-month seasons). Everything is pure math on UTC instants; `tick` converts to `Local` only for logging.
 
@@ -190,20 +208,26 @@ Both routes call `proxy.send_event(AppEvent::Wake(WakeKind::Unlock | WakeKind::P
 
 **Why this doesn't resurrect the manual-override-fight bug**: neither event fires when the user changes theme in Settings — `WM_WTSSESSION_CHANGE` is session lifecycle only, `WM_POWERBROADCAST` is power state only. So ticking on these is safe.
 
-**Deliberate side effect**: a manual override that diverges from the schedule (e.g., user picks Dark mid-day when the schedule says Light) does *not* survive a lock/unlock or wake-from-sleep — `tick()` snaps back to the scheduled theme on `AppEvent::Wake`. This was tested explicitly in the v0.2.0 cycle and accepted as acceptable behavior. Preserving overrides across session events would require tracking the last theme *we* applied and only re-applying on Wake when `last_applied != target` (so a missed transition still reconciles, but a user override doesn't get clobbered). Not implemented; revisit if it becomes annoying.
+**Manual-override preservation (v0.4.0)**: a manual override (Settings or the tray's Toggle Theme) *survives* lock/unlock and wake-from-sleep. The rule is time-based, not theme-based: `TickState.reconciled_next` records the next-transition instant from the last tick that ended in sync; a Wake tick skips the re-apply only when `now < reconciled_next` (no transition passed while away → the divergence is an override, log `applied=skip-override`). Any-length sleeps reconcile correctly — a theme-parity comparison would wrongly preserve an override across an overnight lock spanning sunset *and* sunrise (design-review catch). A FAILED apply deliberately leaves `reconciled_next` stale so subsequent wakes re-apply instead of misreading the failure as an override (the wake becomes a free retry). Decision logic is the pure `decide_tick` + `note_reconciled`/`note_apply_failed` helpers — unit-tested, including event-sequence tests. Overrides still reset at the next natural transition (documented macOS-like behavior), and do not survive a process restart.
 
 ### 6. Tray + menu
 
-Menu: Open Config, Refresh, separator, Quit. Menu events flow through `MenuEvent::set_event_handler` → `EventLoopProxy::send_event(AppEvent::Menu(id))` so clicks wake the event loop even when it's on a 12-hour WaitUntil.
+Menu: Toggle Theme, Open Config, Refresh, separator, Quit. Menu events flow through `MenuEvent::set_event_handler` → `EventLoopProxy::send_event(AppEvent::Menu(id))` so clicks wake the event loop even when it's on a 12-hour WaitUntil.
+
+**Toggle Theme** applies `toggle_target(current_theme())` (opposite of what's on screen; unreadable → Dark) via `apply_theme` directly — it does **not** call `tick()`, does not touch `TickState`, and does not disturb the pending WaitUntil. That's what makes it a manual override: the preservation rule in §5 keeps it across lock/unlock, and the next natural transition resets it. Known accepted race: a toggle within ~5 s of a *tier-2* apply can be reverted by that apply's still-running commit_watcher (unreachable while tier 1 is healthy).
 
 Tray icon is generated in `make_tray_icon`: 32×32 RGBA, half orange (sun) + half dark-blue (moon). Procedural because `tray-icon`'s default placeholder is near-invisible on both taskbar modes; `with_icon` is required for the icon to actually show.
+
+### 7. Fail-loudly plumbing (v0.4.0)
+
+`main()` is now a thin wrapper: `install_panic_hook()` (writes `panic at=file:line:col msg="…"` to events.log — with `panic = "abort"` + windowed subsystem an unhooked panic is zero-trace death; hook body uses `payload_as_str`, no unwraps) → `claim_single_instance()` (`CreateMutexW("Local\\WinThemeSwitcher.single-instance")`; on `ERROR_ALREADY_EXISTS` → log `duplicate_instance`, info MessageBox, exit 0; handle intentionally leaked; mutex-creation *failure* logs and continues) → `run()` (the old main body). Any `Err` from `run()` — tray creation racing the taskbar at login, event-loop build/death — logs `fatal_error msg="…"` and shows a blocking MessageBox before exit 1 (previously: silent death). Wake-listener registration failures are logged per stage (`wake_listener_err stage=… code=…`); `WTSRegisterSessionNotification` gets 3 attempts 2 s apart (terminal-services machinery may not be up when we auto-start at logon). All `msg="…"` fields flow through `sanitize_log_msg` (quotes→apostrophes, newlines→spaces; unit-tested).
 
 ## Dependencies (`Cargo.toml`)
 
 - `chrono`, `sun-times` — sunrise/sunset math.
 - `serde` + `serde_json` — config persistence.
 - `tray-icon`, `winit` — tray + event loop. Menu types come from `muda` (re-exported under `tray_icon::menu`).
-- `windows-sys` (features: `Win32_Foundation`, `Win32_System_Com`, `Win32_System_LibraryLoader`, `Win32_System_Power`, `Win32_System_RemoteDesktop`, `Win32_System_Registry`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Shell`, `Win32_Graphics_Dwm`) — raw Win32 FFI. `Win32_System_Com` is for `CoCreateInstance` + `CLSCTX_INPROC_SERVER` (IThemeManager2). `SysFreeString` lives in `Win32_Foundation` in windows-sys 0.59 (not `Win32_System_Ole` as you might expect).
+- `windows-sys` (features: `Win32_Foundation`, `Win32_Security`, `Win32_System_Com`, `Win32_System_LibraryLoader`, `Win32_System_Power`, `Win32_System_RemoteDesktop`, `Win32_System_Registry`, `Win32_System_Threading`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Shell`, `Win32_Graphics_Dwm`) — raw Win32 FFI. `Win32_System_Com` is for `CoCreateInstance` + `CLSCTX_INPROC_SERVER` (IThemeManager2). `SysFreeString` lives in `Win32_Foundation` in windows-sys 0.59 (not `Win32_System_Ole` as you might expect). `CreateMutexW` (single-instance mutex) needs BOTH `Win32_System_Threading` *and* `Win32_Security` — the function is additionally cfg-gated on the latter because its first parameter is `*const SECURITY_ATTRIBUTES`.
 - `windows` (features: `Devices_Geolocation`, `Foundation`, `Win32_System_Com`) — WinRT Geolocator + `CoInitializeEx` for the main thread's STA. Kept separate from `windows-sys` because the `windows` crate's typed bindings make Geolocator usable; raw `windows-sys` is fine for everything else.
 
 ## Invariants — don't break these
@@ -212,6 +236,10 @@ Tray icon is generated in `make_tray_icon`: 32×32 RGBA, half orange (sun) + hal
 - **STA thread for IThemeManager2**: `ensure_com_initialized` runs `CoInitializeEx(None, COINIT_APARTMENTTHREADED)` first in `main`. All theme apply runs on that thread. Don't spawn worker threads to call `IThemeManager2` methods — they need their own `CoInitializeEx(STA)` and proper marshaling.
 - **`poke_shell` after tier-2 / tier-3 apply only**: tier 1 (`IThemeManager2::SetCurrentTheme`) does the broadcast internally — calling `poke_shell` after it is wasted work and re-introduces the AV-tripping `HWND_BROADCAST WM_SETTINGCHANGE` signal that tier 1 was supposed to eliminate. Keep `poke_shell` for the legacy paths only; don't add it to tier 1.
 - **Refresh forces apply** (bypasses state check); scheduled transitions respect it (no-op if already matching). Don't invert.
+- **`decide_tick` reads the PRE-tick state**; `note_reconciled`/`note_apply_failed` run after the apply outcome is known. A failed apply must leave `reconciled_next` stale — updating it on Err makes the wake rule misread the failure as a user override and strands the wrong theme (the exact blocker the v0.4.0 design review caught). Never "simplify" by assigning state before/regardless of the outcome.
+- **Toggle Theme never ticks and never touches `TickState`** — it's a manual override by construction. Routing it through `tick()` or recording it in state breaks override preservation.
+- **Capture `GetLastError()` into a local immediately** after the failing Win32 call — `Local::now()`, `log_event`, and `format!` all make Win32 calls that clobber the thread's last error. (`PowerRegisterSuspendResumeNotification` is the exception: its error code IS the return value.)
+- **Run tests via `scripts\test.ps1` on this machine**, not bare `cargo test` — the wrapper signs the test binary before first execution (Kaspersky section).
 - **Free BSTRs from `ITheme::GetDisplayName` with `SysFreeString`** — not `CoTaskMemFree`, and definitely don't leak. The wtheme reference treats this strictly.
 - **Vtable order in `IThemeManager2Vtbl`**: every method's slot index must match the COM ABI. Wrong order = calling the wrong method (silently catastrophic). The struct declares every slot up through `set_current_theme` — uncalled interior slots are `_`-prefixed placeholders that are **mandatory padding, never removable**; only trailing slots after the last called method may be omitted, and nothing may ever be reordered. Reference: namazso C# gist + wtheme C header (linked in main.rs comments).
 - **`ensure_com_initialized` before any WinRT call**: otherwise Geolocator returns errors silently.
