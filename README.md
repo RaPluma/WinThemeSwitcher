@@ -15,7 +15,7 @@ Automatically swap between two Windows 11 **themes** at local sunrise and sunset
 
 ## Install
 
-1. Download `win-theme-switcher-vX.Y.Z-windows-x64.zip` from the [latest release](../../releases). Extract to e.g. `C:\Tools\WinThemeSwitcher\`.
+1. Download `win-theme-switcher-vX.Y.Z-windows-x64.zip` from the [latest non-prerelease release](../../releases) — currently [v0.4.0](../../releases/tag/v0.4.0), because v0.4.0 is marked `prerelease: true` (this changes in v0.5.0 — see the [Roadmap](#roadmap) v0.5.0 row, sub-bullet 1d). Extract to e.g. `C:\Tools\WinThemeSwitcher\`.
 2. **Trust the publisher cert** (one-time, recommended — the zip includes `WinThemeSwitcher-publisher.cer`):
    ```powershell
    Import-Certificate -FilePath .\WinThemeSwitcher-publisher.cer -CertStoreLocation Cert:\CurrentUser\Root
@@ -61,21 +61,23 @@ If two copies are launched, the second shows a notice and exits (single-instance
 
 ## Verifying the signature
 
-After importing the publisher cert (Install step 2), check the binary:
-
 ```powershell
 Get-AuthenticodeSignature .\win-theme-switcher.exe | Format-List Status, SignerCertificate
 ```
 
-Should return `Status: Valid` and `Signer: CN=WinThemeSwitcher Self-Signed`. The signature lets you verify the file was signed by this project's publisher key and hasn't been tampered with since signing. Self-signed certs can't suppress SmartScreen — a CA-signed cert reduces prompts over time as reputation accrues (filed under [Roadmap](#roadmap)).
+Should return `Status: Valid` and `Signer: CN=WinThemeSwitcher Self-Signed`. The signature lets you verify the file was signed by this project's publisher key and hasn't been tampered with since signing. Self-signed certs can't suppress SmartScreen — a CA-signed cert reduces prompts over time as reputation accrues (v0.6.0 row in [Roadmap](#roadmap)).
 
 ## Antivirus false positives
+
+**Heads-up: only build with `scripts\build.ps1`.** Bare `cargo build --release` produces an unsigned fresh-hash PE that KSN flags on first execute — see [Building from source](#building-from-source) for the canonical flow. The rest of this section is for users running the **already-signed published binaries**, not for source-builders.
+
+---
 
 The v0.4.0 release ships Authenticode-signed binaries (RSA + SHA256, self-signed publisher cert `CN=WinThemeSwitcher Self-Signed`, thumbprint `40E0D1EB58DAC255EB37E9D64FF34448E3D33D12`). On first install, import the included `WinThemeSwitcher-publisher.cer` into `Cert:\CurrentUser\Root` (and optionally `Cert:\CurrentUser\TrustedPublisher` for SmartScreen) — see [Verifying the signature](#verifying-the-signature). After that, **most AVs accept the binary without any further action**.
 
 **Kaspersky is the exception.** Its Behavior Detection scores cumulative signal — `HKCU\Run` writes, `HWND_BROADCAST` / `WM_SETTINGCHANGE` / `WM_THEMECHANGED` propagation, WinRT Geolocation, COM activation of `themeui.dll`. v0.4.0's tier-1 `IThemeManager2` apply removes the broadcast signals (the COM interface does its own broadcast from inside `themeui.dll`, where the heuristics trust it), but the persistence + Geolocation signals remain. For self-signed-cert releases (v0.4.0), Kaspersky still needs a **Trusted application** rule (Settings → Security → Threats and Exclusions → *Specify trusted applications* → tick all five checkboxes: Do not scan opened files, Do not monitor application activity, Do not inherit restrictions, Do not monitor child application activity, Allow interaction with Kaspersky interface). **The binary is not malicious** — full source is in this repo. A CA-signed cert (planned for v0.6.0, via SignPath Foundation's free OSS program) collapses this further and removes the need for the Trusted-app rule entirely.
 
-If you build from source and run *unsigned* (don't — always use `scripts\build.ps1`), most AVs accept a path-based exclusion, but Kaspersky needs the Trusted-app rule regardless because its Behavior Detection ignores plain exclusions. If your AV quarantines the file anyway, restore it and add the rule before re-running.
+If your AV quarantines the published signed binary anyway, restore it and add the rule before re-running.
 
 ## How it works
 
@@ -91,20 +93,21 @@ Full architecture, threading invariants, and the reasoning behind each tier are 
 
 ## Building from source
 
-Requirements: Rust `stable-x86_64-pc-windows-msvc` + Visual Studio Build Tools with the C++ workload.
+Requirements: Rust `stable-x86_64-pc-windows-msvc` + Visual Studio Build Tools with the C++ workload + Windows SDK (for `signtool.exe`).
 
 ```powershell
 winget install Rustlang.Rustup
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 git clone https://github.com/atefalshehri/WinThemeSwitcher.git
 cd WinThemeSwitcher
-cargo build --release
-# Output: target\release\win-theme-switcher.exe (~330 KB)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1            # build + sign + deploy to C:\Tools\
+# or, for verification only (does not overwrite the installed binary):
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -SkipCopy
 ```
 
-Release profile is tuned for size (`opt-level = "z"`, `lto = true`, `strip = true`, `panic = "abort"`). No `build.rs` — `windows-sys` and `windows` self-link.
+**Do not run `cargo build --release` directly.** It produces an unsigned fresh-hash PE that KSN flags as `VHO:Trojan.Win32.Convagent.gen` on this machine — that's the failure mode that delayed v0.4.0 by six weeks (see the v0.4.0 row in [Roadmap](#roadmap)). `scripts\build.ps1` signs the binary with the project's Authenticode cert + RFC 3161 DigiCert countersignature **before** anything executes it. The same caveat applies to `cargo test` — use `scripts\test.ps1`.
 
-Release builds should be Authenticode-signed before deploy. See [CLAUDE.md → Sign every release build](CLAUDE.md#sign-every-release-build) for the cert-generation + signtool commands.
+Release profile is tuned for size (`opt-level = "z"`, `lto = true`, `strip = true`, `panic = "abort"`). No `build.rs` — `windows-sys` and `windows` self-link. Output ~330 KB. Cert + signing details live in [CLAUDE.md → Sign every release build](CLAUDE.md#sign-every-release-build).
 
 ## Uninstall
 
@@ -119,7 +122,7 @@ No installer, no uninstaller — it's a single-exe tool by design.
 
 ## Roadmap
 
-Ordered by priority. The July 2026 audit's confirmed correctness bugs shipped as fixes in v0.3.x–v0.4.0; release/distribution work is next.
+Ordered by priority. The Aug–Sep 2026 audit's confirmed correctness bugs shipped as fixes in v0.3.x–v0.4.0; release/distribution work is next.
 
 ### Release plan
 
@@ -171,7 +174,7 @@ The release-pipeline hardening items that used to live as a single bullet are no
 
 - **winit `ApplicationHandler` migration** — only when bumping to winit 0.31 (the pinned 0.30 merely deprecates `EventLoop::run`; nothing forces this today). Worth evaluating at that point: dropping winit for a plain Win32 message loop — the pattern already exists in the wake listener.
 
-**Not planned**: GUI configuration (`config.json` + Refresh is the UX), custom wake times (sunrise/sunset is the whole point; offsets from them are fine), cross-platform (Windows only — macOS already has this natively), in-app update check (it would be the binary's only network call and re-adds the autorun+beacon AV-heuristic surface the `IThemeManager2` migration removed — winget/Scoop handle upgrades), pause/snooze toggle (a manual override already pauses until the next transition), and ADM-style scripting/hotkeys/battery rules (out of scope for a ~330 KB tray tool).
+**Not planned**: GUI configuration (`config.json` + Refresh is the UX), custom wake times (sunrise/sunset is the whole point; offsets from them are fine), cross-platform (Windows only — macOS already has this natively), in-app update check (it would re-add the autorun+beacon AV-heuristic surface the `IThemeManager2` migration removed — winget/Scoop handle upgrades), pause/snooze toggle (a manual override already pauses until the next transition), and ADM-style scripting/hotkeys/battery rules (out of scope for a ~330 KB tray tool).
 
 ## Contributing
 
