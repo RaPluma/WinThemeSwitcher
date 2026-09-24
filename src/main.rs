@@ -5,11 +5,11 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, NaiveTime, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sun_times::sun_times;
 use tray_icon::{
@@ -22,7 +22,12 @@ use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::Foundation::{
     GetLastError, SysFreeString, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
 };
+use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, CreateSolidBrush, DeleteObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, HBRUSH, HDC, HFONT, LOGFONTW, TRANSPARENT,
+};
 use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power::PowerRegisterSuspendResumeNotification;
@@ -34,13 +39,25 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Controls::{
+    InitCommonControlsEx, SetWindowTheme, ICC_STANDARD_CLASSES,
+};
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Shell::{SHLoadIndirectString, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW,
-    PostMessageW, RegisterClassW, SendMessageTimeoutW, TranslateMessage, HWND_BROADCAST,
-    HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
-    SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
+    LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
+    ES_AUTOHSCROLL, GWLP_USERDATA, HWND_BROADCAST, HWND_MESSAGE, IDC_ARROW, IDYES,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SMTO_ABORTIFHUNG,
+    SM_CXSCREEN, SM_CYSCREEN, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_POWERBROADCAST, WM_SETFONT, WM_SETTINGCHANGE, WM_THEMECHANGED,
+    WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_OVERLAPPED,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use winit::event::{Event, StartCause};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -229,6 +246,38 @@ struct Config {
     auto_start: bool,
     theme_day: Option<String>,
     theme_night: Option<String>,
+    /// How a switch is applied. `colors_only` (the default) flips only the
+    /// light/dark colours and leaves the wallpaper, cursors, sounds, desktop
+    /// icons and visual style exactly as the user set them. `full_theme`
+    /// applies the whole `.theme` file instead (the pre-0.5.0 behaviour).
+    apply_mode: ApplyMode,
+    /// Fixed local switch times as `"HH:MM"`. When both are set the location is
+    /// not needed at all: no location permission prompt, no coordinates.
+    custom_sunrise: Option<String>,
+    custom_sunset: Option<String>,
+    /// UI language: `auto` (follow the system), `en-US` or `zh-CN`.
+    language: Language,
+}
+
+/// See `Config::apply_mode`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum ApplyMode {
+    #[default]
+    ColorsOnly,
+    FullTheme,
+}
+
+/// See `Config::language`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Language {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "en-US")]
+    English,
+    #[serde(rename = "zh-CN")]
+    Chinese,
 }
 
 impl Default for Config {
@@ -239,6 +288,10 @@ impl Default for Config {
             auto_start: true,
             theme_day: None,
             theme_night: None,
+            apply_mode: ApplyMode::default(),
+            custom_sunrise: None,
+            custom_sunset: None,
+            language: Language::default(),
         }
     }
 }
@@ -247,6 +300,36 @@ impl Config {
     fn has_location(&self) -> bool {
         !(self.latitude == 0.0 && self.longitude == 0.0)
     }
+
+    /// The fixed sunrise/sunset pair, if both are configured and valid.
+    fn custom_times(&self) -> Option<(NaiveTime, NaiveTime)> {
+        let sunrise = parse_hhmm(self.custom_sunrise.as_deref()?)?;
+        let sunset = parse_hhmm(self.custom_sunset.as_deref()?)?;
+        Some((sunrise, sunset))
+    }
+
+    /// True when the app knows when to switch — either from fixed times or from
+    /// a location. Without this the tick can only log `skipped=no-schedule`.
+    fn can_schedule(&self) -> bool {
+        self.custom_times().is_some() || self.has_location()
+    }
+}
+
+/// Parses a `"HH:MM"` (or `"H:MM"`) local time. Anything else — including a
+/// missing value — is `None`, which leaves the feature disabled.
+fn parse_hhmm(s: &str) -> Option<NaiveTime> {
+    let (h, m) = s.trim().split_once(':')?;
+    let hour: u32 = h.trim().parse().ok()?;
+    let minute: u32 = m.trim().parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+/// `"07:30"` for a `NaiveTime`, used by the settings GUI and the config writer.
+fn format_hhmm(t: NaiveTime) -> String {
+    format!("{:02}:{:02}", t.hour(), t.minute())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +523,10 @@ fn retry_deadline(now: DateTime<Local>, next: DateTime<Local>) -> DateTime<Local
 enum AppEvent {
     Menu(MenuId),
     Wake(WakeKind),
+    /// The settings window saved a new config. Boxed to keep the enum small.
+    ConfigChanged(Box<Config>),
+    /// The settings window asked for an immediate switch.
+    ToggleTheme,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -449,6 +536,225 @@ enum WakeKind {
 }
 
 static EVENT_PROXY: OnceLock<EventLoopProxy<AppEvent>> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Localization
+//
+// The UI is English or Simplified Chinese. `Config::language` decides; `auto`
+// follows the Windows UI language. Log lines are deliberately NOT localized —
+// they are diagnostics, and keeping them stable makes them comparable across
+// versions.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    English,
+    Chinese,
+}
+
+/// Every user-visible string. `zh` is the Simplified Chinese translation.
+struct Strings {
+    // tray menu
+    tray_tooltip: &'static str,
+    menu_toggle: &'static str,
+    menu_settings: &'static str,
+    menu_refresh: &'static str,
+    menu_open_config: &'static str,
+    menu_quit: &'static str,
+    // message boxes
+    location_title: &'static str,
+    location_body: &'static str,
+    location_pending_title: &'static str,
+    location_pending_body: &'static str,
+    setup_title: &'static str,
+    setup_body: &'static str,
+    config_error_title: &'static str,
+    config_error_body: &'static str,
+    // settings window
+    settings_title: &'static str,
+    group_switch: &'static str,
+    label_mode: &'static str,
+    mode_colors_only: &'static str,
+    mode_full_theme: &'static str,
+    group_schedule: &'static str,
+    label_sunrise: &'static str,
+    label_sunset: &'static str,
+    hint_time_format: &'static str,
+    label_latitude: &'static str,
+    label_longitude: &'static str,
+    button_use_location: &'static str,
+    hint_location: &'static str,
+    label_autostart: &'static str,
+    label_language: &'static str,
+    lang_auto: &'static str,
+    lang_english: &'static str,
+    lang_chinese: &'static str,
+    button_save: &'static str,
+    button_cancel: &'static str,
+    button_switch_now: &'static str,
+    button_open_config: &'static str,
+    button_open_log: &'static str,
+    status_ready: &'static str,
+    error_time_format: &'static str,
+    error_coordinates: &'static str,
+    status_saved: &'static str,
+    status_location_failed: &'static str,
+}
+
+static STRINGS_EN: Strings = Strings {
+    tray_tooltip: "WinThemeSwitcher — light/dark at sunrise and sunset",
+    menu_toggle: "Toggle Theme",
+    menu_settings: "Settings…",
+    menu_refresh: "Refresh",
+    menu_open_config: "Open Config",
+    menu_quit: "Quit",
+    location_title: "WinThemeSwitcher — Location",
+    location_body: "Windows Location is off or not allowed for desktop apps.\n\n\
+                    Enable it so sunrise and sunset can be computed automatically?\n\n\
+                    Yes opens Windows Settings. No lets you set the times or coordinates yourself.",
+    location_pending_title: "WinThemeSwitcher",
+    location_pending_body: "Turn on \"Location services\" in the Settings window that just opened. \
+                            Then open the WinThemeSwitcher settings and press Save, or choose Refresh.",
+    setup_title: "WinThemeSwitcher — Setup",
+    setup_body: "No switch times yet. Open the settings (tray icon → Settings…) and either set \
+                 fixed sunrise/sunset times or fetch your location.",
+    config_error_title: "WinThemeSwitcher — Config error",
+    config_error_body: "The file was left unchanged — your settings are still in it. \
+                        Fix the error (tray menu → Open Config), then choose Refresh.",
+    settings_title: "WinThemeSwitcher Settings",
+    group_switch: "Switching",
+    label_mode: "Mode",
+    mode_colors_only: "Only switch light/dark (keep wallpaper, cursors, sounds)",
+    mode_full_theme: "Apply the whole .theme file (also changes wallpaper, cursors, sounds)",
+    group_schedule: "Schedule",
+    label_sunrise: "Sunrise",
+    label_sunset: "Sunset",
+    hint_time_format: "24h HH:MM (e.g. 07:30). Leave both empty to use the location below.",
+    label_latitude: "Latitude",
+    label_longitude: "Longitude",
+    button_use_location: "Use current location",
+    hint_location: "Only needed when no fixed times are set. 0 / 0 means \"not set\".",
+    label_autostart: "Start automatically at login",
+    label_language: "Language",
+    lang_auto: "Follow system",
+    lang_english: "English",
+    lang_chinese: "简体中文",
+    button_save: "Save and apply",
+    button_cancel: "Cancel",
+    button_switch_now: "Switch now",
+    button_open_config: "Open config file",
+    button_open_log: "Open log",
+    status_ready: "Changes are applied immediately.",
+    error_time_format: "Invalid time — use 24h HH:MM, for example 07:30.",
+    error_coordinates: "Invalid coordinates — latitude -90..90, longitude -180..180.",
+    status_saved: "Saved. The schedule was recalculated.",
+    status_location_failed: "Windows did not report a location. Turn on Location services and retry.",
+};
+
+static STRINGS_ZH: Strings = Strings {
+    tray_tooltip: "WinThemeSwitcher — 日出日落自动切换深浅色",
+    menu_toggle: "立即切换深浅色",
+    menu_settings: "设置…",
+    menu_refresh: "刷新",
+    menu_open_config: "打开配置文件",
+    menu_quit: "退出",
+    location_title: "WinThemeSwitcher — 位置",
+    location_body: "Windows 位置服务未开启，或未允许桌面应用使用。\n\n\
+                    是否开启，以便自动按经纬度计算日出日落？\n\n\
+                    选「是」会打开 Windows 设置；选「否」可以在设置里自己填时间或坐标。",
+    location_pending_title: "WinThemeSwitcher",
+    location_pending_body: "请在弹出的设置窗口里打开「位置服务」，\
+                            然后打开 WinThemeSwitcher 的设置点「保存并应用」，或选择「刷新」。",
+    setup_title: "WinThemeSwitcher — 初始设置",
+    setup_body: "还没有切换时间。请打开设置（托盘图标 → 设置…），\
+                 填写固定的日出/日落时间，或获取当前位置。",
+    config_error_title: "WinThemeSwitcher — 配置错误",
+    config_error_body: "配置文件未被改动，你的设置还在里面。\
+                        修好错误后（托盘菜单 → 打开配置文件）选择「刷新」。",
+    settings_title: "WinThemeSwitcher 设置",
+    group_switch: "切换方式",
+    label_mode: "模式",
+    mode_colors_only: "只切换深色/浅色（壁纸、指针、声音都不动）",
+    mode_full_theme: "应用完整主题文件（会一起改壁纸、指针、声音）",
+    group_schedule: "切换时间",
+    label_sunrise: "日出时间",
+    label_sunset: "日落时间",
+    hint_time_format: "24 小时制 HH:MM（例如 07:30）。两个都留空则使用下面的经纬度。",
+    label_latitude: "纬度",
+    label_longitude: "经度",
+    button_use_location: "获取当前位置",
+    hint_location: "仅在未填写固定时间时需要；0 / 0 表示未设置。",
+    label_autostart: "开机时自动启动",
+    label_language: "界面语言",
+    lang_auto: "跟随系统",
+    lang_english: "English",
+    lang_chinese: "简体中文",
+    button_save: "保存并应用",
+    button_cancel: "取消",
+    button_switch_now: "立即切换一次",
+    button_open_config: "打开配置文件",
+    button_open_log: "打开日志",
+    status_ready: "修改后立即生效。",
+    error_time_format: "时间格式不正确：请用 24 小时制 HH:MM，例如 07:30。",
+    error_coordinates: "经纬度不正确：纬度 -90~90，经度 -180~180。",
+    status_saved: "已保存，并已按新设置重新计算。",
+    status_location_failed: "Windows 没有返回位置，请开启「位置服务」后重试。",
+};
+
+/// 0 = not resolved yet, 1 = English, 2 = Chinese. An atomic rather than a
+/// `OnceLock` because the language can be changed in the settings window
+/// without restarting the app.
+static LANG: AtomicU8 = AtomicU8::new(0);
+
+fn resolve_language(configured: Language) -> Lang {
+    match configured {
+        Language::English => Lang::English,
+        Language::Chinese => Lang::Chinese,
+        Language::Auto => detect_system_language(),
+    }
+}
+
+/// Sets the UI language. Called at startup and whenever the config changes.
+fn set_language(configured: Language) {
+    store_language(resolve_language(configured));
+}
+
+fn store_language(lang: Lang) {
+    let encoded = match lang {
+        Lang::English => 1,
+        Lang::Chinese => 2,
+    };
+    LANG.store(encoded, Ordering::SeqCst);
+}
+
+fn detect_system_language() -> Lang {
+    // PRIMARYLANGID(lang) == LANG_CHINESE (0x04)
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    if langid & 0x3ff == 0x04 {
+        Lang::Chinese
+    } else {
+        Lang::English
+    }
+}
+
+fn lang() -> Lang {
+    match LANG.load(Ordering::SeqCst) {
+        2 => Lang::Chinese,
+        1 => Lang::English,
+        _ => {
+            let detected = detect_system_language();
+            store_language(detected);
+            detected
+        }
+    }
+}
+
+fn strings() -> &'static Strings {
+    match lang() {
+        Lang::English => &STRINGS_EN,
+        Lang::Chinese => &STRINGS_ZH,
+    }
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -600,32 +906,859 @@ fn show_message_box(title: &str, body: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(ptr::null_mut(), body_w.as_ptr(), title_w.as_ptr(), flags) }
 }
 
+// ---------------------------------------------------------------------------
+// Native settings window
+//
+// A plain Win32 window with standard controls (the Common Controls v6 classes
+// activated by app.manifest), so it looks and behaves like a system dialog.
+// It lives on its own thread with its own message loop: the winit event loop
+// keeps running, so scheduled switches still fire while the window is open.
+// Saving writes the config and hands it back to the main loop through the
+// event-loop proxy, which recalcs the schedule and re-applies.
+// ---------------------------------------------------------------------------
+mod settings_ui {
+    use super::*;
+
+    // Control ids. Labels carry no id (they are never clicked).
+    const ID_MODE: usize = 1001;
+    const ID_SUNRISE: usize = 1002;
+    const ID_SUNSET: usize = 1003;
+    const ID_LAT: usize = 1004;
+    const ID_LON: usize = 1005;
+    const ID_AUTOSTART: usize = 1006;
+    const ID_LANGUAGE: usize = 1007;
+    const ID_SAVE: usize = 1008;
+    const ID_CANCEL: usize = 1009;
+    const ID_SWITCH_NOW: usize = 1010;
+    const ID_USE_LOCATION: usize = 1011;
+    const ID_OPEN_CONFIG: usize = 1012;
+    const ID_OPEN_LOG: usize = 1013;
+    const ID_STATUS: usize = 1014;
+
+    /// `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)` — windows-sys 0.59
+    /// does not export the constant for this one.
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+
+    /// Only one settings window at a time.
+    static WINDOW_OPEN: AtomicBool = AtomicBool::new(false);
+
+    /// Left-aligned static text. windows-sys does not export this (it is 0).
+    const SS_LEFT: u32 = 0x0000_0000;
+
+    struct State {
+        /// The config as loaded — kept so Cancel leaves nothing half-applied.
+        cfg: Config,
+        proxy: EventLoopProxy<AppEvent>,
+        font: HFONT,
+        background: HBRUSH,
+        edit_background: HBRUSH,
+        dark: bool,
+        mode: HWND,
+        sunrise: HWND,
+        sunset: HWND,
+        latitude: HWND,
+        longitude: HWND,
+        autostart: HWND,
+        language: HWND,
+        status: HWND,
+        labels: Vec<HWND>,
+        buttons: Vec<HWND>,
+    }
+
+    /// Opens the settings window on a dedicated thread.
+    pub fn open(cfg: Config, proxy: EventLoopProxy<AppEvent>) {
+        if WINDOW_OPEN.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::spawn(move || {
+            if let Err(e) = run_window(cfg, proxy) {
+                log_event(&format!(
+                    "{} settings_window_err msg=\"{}\"",
+                    Local::now().to_rfc3339(),
+                    sanitize_log_msg(&e)
+                ));
+            }
+            WINDOW_OPEN.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn run_window(cfg: Config, proxy: EventLoopProxy<AppEvent>) -> Result<(), String> {
+        ensure_com_initialized();
+        unsafe {
+            let icc = windows_sys::Win32::UI::Controls::INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<windows_sys::Win32::UI::Controls::INITCOMMONCONTROLSEX>(
+                ) as u32,
+                dwICC: ICC_STANDARD_CLASSES,
+            };
+            InitCommonControlsEx(&icc);
+        }
+
+        let s = strings();
+        let class_name = wide("WinThemeSwitcher.Settings");
+        let title = wide(s.settings_title);
+        let instance = unsafe { GetModuleHandleW(ptr::null()) };
+
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: ptr::null_mut(),
+            hCursor: unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) },
+            hbrBackground: ptr::null_mut(),
+            lpszMenuName: ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        if unsafe { RegisterClassW(&wc) } == 0 {
+            return Err("RegisterClassW failed".into());
+        }
+
+        let dpi = desktop_dpi();
+        let (w, h) = scaled_size(dpi);
+        let x = unsafe { GetSystemMetrics(SM_CXSCREEN) } / 2 - w / 2;
+        let y = unsafe { GetSystemMetrics(SM_CYSCREEN) } / 2 - h / 2;
+
+        let state = Box::new(State {
+            cfg,
+            proxy,
+            font: ptr::null_mut(),
+            background: ptr::null_mut(),
+            edit_background: ptr::null_mut(),
+            dark: current_theme() == Some(Theme::Dark),
+            mode: ptr::null_mut(),
+            sunrise: ptr::null_mut(),
+            sunset: ptr::null_mut(),
+            latitude: ptr::null_mut(),
+            longitude: ptr::null_mut(),
+            autostart: ptr::null_mut(),
+            language: ptr::null_mut(),
+            status: ptr::null_mut(),
+            labels: Vec::new(),
+            buttons: Vec::new(),
+        });
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_DLGMODALFRAME,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                x,
+                y,
+                w,
+                h,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                instance,
+                Box::into_raw(state) as *const c_void,
+            )
+        };
+        if hwnd.is_null() {
+            return Err("CreateWindowExW failed".into());
+        }
+
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+            SetForegroundWindow(hwnd);
+            let mut msg = std::mem::zeroed::<MSG>();
+            while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        Ok(())
+    }
+
+    fn desktop_dpi() -> u32 {
+        // Any window works for the initial size; use the primary monitor's DPI.
+        unsafe {
+            let hwnd = desktop_window();
+            if hwnd.is_null() {
+                96
+            } else {
+                let dpi = GetDpiForWindow(hwnd);
+                if dpi == 0 {
+                    96
+                } else {
+                    dpi
+                }
+            }
+        }
+    }
+
+    /// `GetDesktopWindow` without pulling in another windows-sys import.
+    fn desktop_window() -> HWND {
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetDesktopWindow() }
+    }
+
+    fn scaled(value: i32, dpi: u32) -> i32 {
+        (value * dpi as i32) / 96
+    }
+
+    fn scaled_size(dpi: u32) -> (i32, i32) {
+        (scaled(560, dpi), scaled(430, dpi))
+    }
+
+    fn text_of(hwnd: HWND) -> String {
+        unsafe {
+            let len = GetWindowTextLengthW(hwnd);
+            let mut buf = vec![0u16; len as usize + 1];
+            let copied = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            String::from_utf16_lossy(&buf[..copied.max(0) as usize])
+        }
+    }
+
+    fn set_text(hwnd: HWND, text: &str) {
+        let wide = wide(text);
+        unsafe { SetWindowTextW(hwnd, wide.as_ptr()) };
+    }
+
+    fn combo_index(hwnd: HWND) -> usize {
+        let index = unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0) };
+        if index < 0 {
+            0
+        } else {
+            index as usize
+        }
+    }
+
+    fn combo_select(hwnd: HWND, index: usize) {
+        unsafe { SendMessageW(hwnd, CB_SETCURSEL, index, 0) };
+    }
+
+    fn is_checked(hwnd: HWND) -> bool {
+        unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) == 1 }
+    }
+
+    fn set_checked(hwnd: HWND, checked: bool) {
+        unsafe { SendMessageW(hwnd, BM_SETCHECK, usize::from(checked), 0) };
+    }
+
+    fn create(parent: HWND, class: &str, text: &str, style: u32, ex_style: u32, id: usize) -> HWND {
+        let class_w = wide(class);
+        let text_w = wide(text);
+        unsafe {
+            CreateWindowExW(
+                ex_style,
+                class_w.as_ptr(),
+                text_w.as_ptr(),
+                style,
+                0,
+                0,
+                0,
+                0,
+                parent,
+                id as *mut c_void,
+                GetModuleHandleW(ptr::null()),
+                ptr::null(),
+            )
+        }
+    }
+
+    fn create_label(parent: HWND, text: &str) -> HWND {
+        create(
+            parent,
+            "STATIC",
+            text,
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0,
+            0,
+        )
+    }
+
+    fn create_edit(parent: HWND, text: &str, id: usize) -> HWND {
+        create(
+            parent,
+            "EDIT",
+            text,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            0x00000200, // WS_EX_CLIENTEDGE
+            id,
+        )
+    }
+
+    fn create_combo(parent: HWND, id: usize) -> HWND {
+        create(
+            parent,
+            "COMBOBOX",
+            "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST as u32,
+            0,
+            id,
+        )
+    }
+
+    fn create_button(parent: HWND, text: &str, id: usize, default: bool) -> HWND {
+        let style = WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | if default {
+                BS_DEFPUSHBUTTON as u32
+            } else {
+                BS_PUSHBUTTON as u32
+            };
+        create(parent, "BUTTON", text, style, 0, id)
+    }
+
+    fn create_checkbox(parent: HWND, text: &str, id: usize) -> HWND {
+        create(
+            parent,
+            "BUTTON",
+            text,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+            0,
+            id,
+        )
+    }
+
+    fn position(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MoveWindow(hwnd, x, y, w, h, 1);
+        }
+    }
+
+    /// (Re)builds the font, colours and layout for the current DPI and theme.
+    fn layout(hwnd: HWND, st: &mut State) {
+        let dpi = unsafe {
+            let d = GetDpiForWindow(hwnd);
+            if d == 0 {
+                96
+            } else {
+                d
+            }
+        };
+        let pad = scaled(16, dpi);
+        let row = scaled(26, dpi);
+        let gap = scaled(10, dpi);
+
+        // Font: the system message font keeps the dialog looking native.
+        unsafe {
+            let mut ncm: windows_sys::Win32::UI::WindowsAndMessaging::NONCLIENTMETRICSW =
+                std::mem::zeroed();
+            ncm.cbSize = std::mem::size_of_val(&ncm) as u32;
+            let mut lf: LOGFONTW = std::mem::zeroed();
+            if SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS,
+                ncm.cbSize,
+                &mut ncm as *mut _ as *mut c_void,
+                0,
+            ) != 0
+            {
+                lf = ncm.lfMessageFont;
+            } else {
+                lf.lfHeight = -scaled(12, dpi);
+            }
+            let new_font = CreateFontIndirectW(&lf);
+            if !st.font.is_null() {
+                DeleteObject(st.font);
+            }
+            st.font = new_font;
+
+            if !st.background.is_null() {
+                DeleteObject(st.background);
+            }
+            if !st.edit_background.is_null() {
+                DeleteObject(st.edit_background);
+            }
+            let (bg, edit_bg) = if st.dark {
+                (0x0020_2020u32, 0x002B_2B2Bu32)
+            } else {
+                (0x00F0_F0F0u32, 0x00FF_FFFFu32)
+            };
+            st.background = CreateSolidBrush(bg);
+            st.edit_background = CreateSolidBrush(edit_bg);
+
+            for ctl in st.labels.iter().chain(st.buttons.iter()).copied().chain([
+                st.mode,
+                st.sunrise,
+                st.sunset,
+                st.latitude,
+                st.longitude,
+                st.autostart,
+                st.language,
+                st.status,
+            ]) {
+                if !ctl.is_null() {
+                    SendMessageW(ctl, WM_SETFONT, st.font as usize, 1);
+                }
+            }
+
+            // Dark title bar. The edits/lists are deliberately NOT switched to
+            // "DarkMode_Explorer": a themed edit ignores the brush returned by
+            // WM_CTLCOLOREDIT and stays white, while an unthemed one honours it
+            // (and the control is created fresh, so there is nothing to undo).
+            let dark_flag: i32 = i32::from(st.dark);
+            let _ = windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark_flag as *const i32 as *const c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            if !st.dark {
+                let theme_name = wide("Explorer");
+                for ctl in [
+                    st.mode,
+                    st.language,
+                    st.sunrise,
+                    st.sunset,
+                    st.latitude,
+                    st.longitude,
+                ] {
+                    if !ctl.is_null() {
+                        SetWindowTheme(ctl, theme_name.as_ptr(), ptr::null());
+                    }
+                }
+            }
+        }
+
+        // --- layout -------------------------------------------------------
+        let x = pad;
+        let mut y = pad;
+        let w = scaled(528, dpi);
+
+        position(st.labels[0], x, y, w, row); // group: switching
+        y += row + gap / 2;
+        position(st.labels[1], x, y + scaled(4, dpi), scaled(90, dpi), row);
+        position(
+            st.mode,
+            x + scaled(90, dpi),
+            y,
+            w - scaled(90, dpi),
+            scaled(200, dpi),
+        );
+        y += row + gap;
+        position(st.labels[2], x, y, w, row); // group: schedule
+        y += row + gap / 2;
+        let col = scaled(90, dpi);
+        let edit_w = scaled(120, dpi);
+        position(st.labels[3], x, y + scaled(4, dpi), col, row);
+        position(st.sunrise, x + col, y, edit_w, row);
+        position(
+            st.labels[4],
+            x + col + edit_w + scaled(24, dpi),
+            y + scaled(4, dpi),
+            col,
+            row,
+        );
+        position(
+            st.sunset,
+            x + col * 2 + edit_w + scaled(24, dpi),
+            y,
+            edit_w,
+            row,
+        );
+        y += row + scaled(2, dpi);
+        position(st.labels[5], x, y, w, scaled(20, dpi)); // time format hint
+        y += scaled(20, dpi) + gap / 2;
+        position(st.labels[6], x, y + scaled(4, dpi), col, row);
+        position(st.latitude, x + col, y, edit_w, row);
+        position(
+            st.labels[7],
+            x + col + edit_w + scaled(24, dpi),
+            y + scaled(4, dpi),
+            col,
+            row,
+        );
+        position(
+            st.longitude,
+            x + col * 2 + edit_w + scaled(24, dpi),
+            y,
+            edit_w,
+            row,
+        );
+        y += row + scaled(2, dpi);
+        position(st.labels[8], x, y, w - scaled(140, dpi), scaled(20, dpi)); // location hint
+        position(
+            st.buttons[4],
+            x + w - scaled(140, dpi),
+            y - scaled(4, dpi),
+            scaled(140, dpi),
+            row,
+        );
+        y += scaled(20, dpi) + gap;
+        position(st.autostart, x, y, w, row);
+        y += row + gap / 2;
+        position(st.labels[9], x, y + scaled(4, dpi), col, row);
+        position(st.language, x + col, y, scaled(180, dpi), scaled(200, dpi));
+        y += row + gap;
+        position(st.status, x, y, w, scaled(34, dpi));
+        y += scaled(34, dpi) + gap / 2;
+        let bw = scaled(110, dpi);
+        let bh = scaled(30, dpi);
+        position(st.buttons[0], x + w - bw * 2 - gap, y, bw, bh); // save
+        position(st.buttons[1], x + w - bw, y, bw, bh); // cancel
+        position(st.buttons[2], x, y, scaled(120, dpi), bh); // switch now
+        position(st.buttons[3], x + scaled(130, dpi), y, scaled(120, dpi), bh); // open config
+        position(st.buttons[5], x + scaled(260, dpi), y, scaled(100, dpi), bh); // open log
+
+        // Grow the window if the layout needs more room than the initial size.
+        let (_, min_h) = scaled_size(dpi);
+        let needed = y + bh + pad;
+        if needed > min_h {
+            unsafe {
+                let mut rect = std::mem::zeroed::<windows_sys::Win32::Foundation::RECT>();
+                GetClientRect(hwnd, &mut rect);
+                let frame_w = scaled(560, dpi) - rect.right;
+                let frame_h = min_h - rect.bottom;
+                windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                    hwnd,
+                    ptr::null_mut(),
+                    0,
+                    0,
+                    scaled(560, dpi) + frame_w,
+                    needed + frame_h,
+                    windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                        | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                );
+            }
+        }
+    }
+
+    fn create_controls(hwnd: HWND, st: &mut State) {
+        let s = strings();
+        st.labels.push(create_label(hwnd, s.group_switch));
+        st.labels.push(create_label(hwnd, s.label_mode));
+        st.mode = create_combo(hwnd, ID_MODE);
+        for text in [s.mode_colors_only, s.mode_full_theme] {
+            let w = wide(text);
+            unsafe { SendMessageW(st.mode, CB_ADDSTRING, 0, w.as_ptr() as isize) };
+        }
+        combo_select(
+            st.mode,
+            usize::from(st.cfg.apply_mode == ApplyMode::FullTheme),
+        );
+
+        st.labels.push(create_label(hwnd, s.group_schedule));
+        st.labels.push(create_label(hwnd, s.label_sunrise));
+        st.sunrise = create_edit(
+            hwnd,
+            &st.cfg.custom_sunrise.clone().unwrap_or_default(),
+            ID_SUNRISE,
+        );
+        st.labels.push(create_label(hwnd, s.label_sunset));
+        st.sunset = create_edit(
+            hwnd,
+            &st.cfg.custom_sunset.clone().unwrap_or_default(),
+            ID_SUNSET,
+        );
+        st.labels.push(create_label(hwnd, s.hint_time_format));
+        st.labels.push(create_label(hwnd, s.label_latitude));
+        st.latitude = create_edit(hwnd, &format_coord(st.cfg.latitude), ID_LAT);
+        st.labels.push(create_label(hwnd, s.label_longitude));
+        st.longitude = create_edit(hwnd, &format_coord(st.cfg.longitude), ID_LON);
+        st.labels.push(create_label(hwnd, s.hint_location));
+        st.buttons
+            .push(create_button(hwnd, s.button_save, ID_SAVE, true));
+        st.buttons
+            .push(create_button(hwnd, s.button_cancel, ID_CANCEL, false));
+        st.buttons.push(create_button(
+            hwnd,
+            s.button_switch_now,
+            ID_SWITCH_NOW,
+            false,
+        ));
+        st.buttons.push(create_button(
+            hwnd,
+            s.button_open_config,
+            ID_OPEN_CONFIG,
+            false,
+        ));
+        st.buttons.push(create_button(
+            hwnd,
+            s.button_use_location,
+            ID_USE_LOCATION,
+            false,
+        ));
+        st.buttons
+            .push(create_button(hwnd, s.button_open_log, ID_OPEN_LOG, false));
+
+        st.autostart = create_checkbox(hwnd, s.label_autostart, ID_AUTOSTART);
+        set_checked(st.autostart, st.cfg.auto_start);
+
+        st.labels.push(create_label(hwnd, s.label_language));
+        st.language = create_combo(hwnd, ID_LANGUAGE);
+        for text in [s.lang_auto, s.lang_english, s.lang_chinese] {
+            let w = wide(text);
+            unsafe { SendMessageW(st.language, CB_ADDSTRING, 0, w.as_ptr() as isize) };
+        }
+        combo_select(
+            st.language,
+            match st.cfg.language {
+                Language::Auto => 0,
+                Language::English => 1,
+                Language::Chinese => 2,
+            },
+        );
+
+        st.status = create(
+            hwnd,
+            "STATIC",
+            s.status_ready,
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0,
+            ID_STATUS,
+        );
+    }
+
+    fn format_coord(value: f64) -> String {
+        if value == 0.0 {
+            String::new()
+        } else {
+            format!("{value}")
+        }
+    }
+
+    fn parse_coord(text: &str) -> Option<f64> {
+        let t = text.trim();
+        if t.is_empty() {
+            return Some(0.0);
+        }
+        t.replace(',', ".").parse().ok()
+    }
+
+    fn save(st: &State) {
+        let s = strings();
+        let sunrise_in = text_of(st.sunrise);
+        let sunset_in = text_of(st.sunset);
+        let (sunrise, sunset) = if sunrise_in.trim().is_empty() && sunset_in.trim().is_empty() {
+            (None, None)
+        } else if parse_hhmm(&sunrise_in).is_some() && parse_hhmm(&sunset_in).is_some() {
+            (
+                Some(format_hhmm(parse_hhmm(&sunrise_in).unwrap())),
+                Some(format_hhmm(parse_hhmm(&sunset_in).unwrap())),
+            )
+        } else {
+            set_text(st.status, s.error_time_format);
+            return;
+        };
+
+        let (Some(latitude), Some(longitude)) = (
+            parse_coord(&text_of(st.latitude)),
+            parse_coord(&text_of(st.longitude)),
+        ) else {
+            set_text(st.status, s.error_coordinates);
+            return;
+        };
+        if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
+            set_text(st.status, s.error_coordinates);
+            return;
+        }
+
+        let mut cfg = st.cfg.clone();
+        cfg.apply_mode = if combo_index(st.mode) == 1 {
+            ApplyMode::FullTheme
+        } else {
+            ApplyMode::ColorsOnly
+        };
+        cfg.custom_sunrise = sunrise;
+        cfg.custom_sunset = sunset;
+        cfg.latitude = latitude;
+        cfg.longitude = longitude;
+        cfg.auto_start = is_checked(st.autostart);
+        cfg.language = match combo_index(st.language) {
+            1 => Language::English,
+            2 => Language::Chinese,
+            _ => Language::Auto,
+        };
+
+        match save_config(&cfg) {
+            Ok(()) => {
+                log_event(&format!(
+                    "{} settings_saved mode={:?} sunrise={} sunset={} lat={} lon={} autostart={} language={:?}",
+                    Local::now().to_rfc3339(),
+                    cfg.apply_mode,
+                    cfg.custom_sunrise.as_deref().unwrap_or("-"),
+                    cfg.custom_sunset.as_deref().unwrap_or("-"),
+                    cfg.latitude,
+                    cfg.longitude,
+                    cfg.auto_start,
+                    cfg.language,
+                ));
+                let _ = st.proxy.send_event(AppEvent::ConfigChanged(Box::new(cfg)));
+                set_text(st.status, s.status_saved);
+            }
+            Err(e) => set_text(st.status, &format!("{e}")),
+        }
+    }
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut State;
+        match msg {
+            WM_CREATE => {
+                let createstruct =
+                    lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
+                let state = unsafe { (*createstruct).lpCreateParams as *mut State };
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
+                let st = unsafe { &mut *state };
+                create_controls(hwnd, st);
+                layout(hwnd, st);
+                0
+            }
+            WM_COMMAND => {
+                if state_ptr.is_null() {
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                }
+                let st = unsafe { &mut *state_ptr };
+                let id = wparam & 0xffff;
+                match id {
+                    ID_SAVE => save(st),
+                    ID_CANCEL => unsafe {
+                        DestroyWindow(hwnd);
+                    },
+                    ID_SWITCH_NOW => {
+                        let _ = st.proxy.send_event(AppEvent::ToggleTheme);
+                    }
+                    ID_OPEN_CONFIG => open_config_in_editor(),
+                    ID_OPEN_LOG => {
+                        let path = log_path();
+                        let path_w = wide(&path.to_string_lossy());
+                        let verb = wide("open");
+                        unsafe {
+                            ShellExecuteW(
+                                ptr::null_mut(),
+                                verb.as_ptr(),
+                                path_w.as_ptr(),
+                                ptr::null(),
+                                ptr::null(),
+                                SW_SHOWNORMAL,
+                            );
+                        }
+                    }
+                    ID_USE_LOCATION => {
+                        // Uses the same Windows Location path as startup. The
+                        // thread already has COM initialized (run_window).
+                        match try_get_windows_location() {
+                            Some((lat, lon)) => {
+                                set_text(st.latitude, &format!("{lat}"));
+                                set_text(st.longitude, &format!("{lon}"));
+                                set_text(st.status, strings().status_ready);
+                            }
+                            None => {
+                                set_text(st.status, strings().status_location_failed);
+                                open_location_settings();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                0
+            }
+            WM_CTLCOLORSTATIC => {
+                if state_ptr.is_null() {
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                }
+                let st = unsafe { &*state_ptr };
+                unsafe {
+                    SetBkMode(wparam as HDC, TRANSPARENT as i32);
+                    SetTextColor(
+                        wparam as HDC,
+                        if st.dark { 0x00F0_F0F0 } else { 0x0020_2020 },
+                    );
+                }
+                st.background as LRESULT
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                if state_ptr.is_null() {
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                }
+                let st = unsafe { &*state_ptr };
+                unsafe {
+                    SetTextColor(
+                        wparam as HDC,
+                        if st.dark { 0x00F0_F0F0 } else { 0x0020_2020 },
+                    );
+                    SetBkColor(
+                        wparam as HDC,
+                        if st.dark { 0x002B_2B2B } else { 0x00FF_FFFF },
+                    );
+                }
+                st.edit_background as LRESULT
+            }
+            // The window itself has no class background brush (it depends on
+            // the light/dark state), so paint it here.
+            WM_ERASEBKGND => {
+                if state_ptr.is_null() {
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                }
+                let st = unsafe { &*state_ptr };
+                let mut rect = std::mem::zeroed::<windows_sys::Win32::Foundation::RECT>();
+                unsafe {
+                    GetClientRect(hwnd, &mut rect);
+                    windows_sys::Win32::Graphics::Gdi::FillRect(
+                        wparam as HDC,
+                        &rect,
+                        st.background,
+                    );
+                }
+                1
+            }
+            WM_DPICHANGED | WM_THEMECHANGED | WM_SETTINGCHANGE => {
+                if !state_ptr.is_null() {
+                    let st = unsafe { &mut *state_ptr };
+                    st.dark = current_theme() == Some(Theme::Dark);
+                    layout(hwnd, st);
+                }
+                0
+            }
+            WM_CLOSE => {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
+                0
+            }
+            WM_DESTROY => {
+                if !state_ptr.is_null() {
+                    let st = unsafe { Box::from_raw(state_ptr) };
+                    unsafe {
+                        if !st.font.is_null() {
+                            DeleteObject(st.font);
+                        }
+                        if !st.background.is_null() {
+                            DeleteObject(st.background);
+                        }
+                        if !st.edit_background.is_null() {
+                            DeleteObject(st.edit_background);
+                        }
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    }
+                }
+                // Ends the settings thread's message loop.
+                unsafe { PostQuitMessage(0) };
+                0
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+}
+
 fn ask_enable_location() -> bool {
+    let s = strings();
     show_message_box(
-        "WinThemeSwitcher — Location",
-        "Windows Location is off or not allowed for desktop apps.\n\n\
-         Enable it so sunrise and sunset can be computed automatically?\n\n\
-         Yes opens Windows Settings. No lets you enter coordinates manually in config.json.",
+        s.location_title,
+        s.location_body,
         MB_YESNO | MB_ICONQUESTION,
     ) == IDYES
 }
 
 fn show_enable_pending_message() {
+    let s = strings();
     show_message_box(
-        "WinThemeSwitcher",
-        "Turn on \"Location services\" in the Settings window that just opened. \
-         Then right-click the WinThemeSwitcher tray icon and choose Refresh.",
+        s.location_pending_title,
+        s.location_pending_body,
         MB_OK | MB_ICONINFORMATION,
     );
 }
 
 fn show_manual_setup_prompt() {
-    show_message_box(
-        "WinThemeSwitcher — Setup",
-        "Please set latitude and longitude in config.json (opening now), \
-         then right-click the tray icon and choose Refresh.",
-        MB_OK | MB_ICONINFORMATION,
-    );
+    let s = strings();
+    show_message_box(s.setup_title, s.setup_body, MB_OK | MB_ICONINFORMATION);
     open_config_in_editor();
 }
 
@@ -650,16 +1783,9 @@ fn report_config_error(err: &str) {
     if CONFIG_ERROR_BOX_OPEN.swap(true, Ordering::SeqCst) {
         return;
     }
-    let body = format!(
-        "{err}\n\nThe file was left unchanged — your settings are still in it. \
-         Fix the error (tray menu → Open Config), then choose Refresh.",
-    );
+    let body = format!("{err}\n\n{}", strings().config_error_body);
     std::thread::spawn(move || {
-        show_message_box(
-            "WinThemeSwitcher — Config error",
-            &body,
-            MB_OK | MB_ICONWARNING,
-        );
+        show_message_box(strings().config_error_title, &body, MB_OK | MB_ICONWARNING);
         CONFIG_ERROR_BOX_OPEN.store(false, Ordering::SeqCst);
     });
 }
@@ -1055,7 +2181,19 @@ fn apply_via_theme_manager2(theme: Theme, theme_file: &Path) -> Result<(), Box<d
 ///   1. IThemeManager2  — atomic, reliable, no Settings UWP, no AV-tripping broadcast.
 ///   2. ShellExecuteW(.theme) + commit_watcher — legacy. Watcher promotes to (3) on silent fail.
 ///   3. Direct registry write — flips light/dark mode but not wallpaper. Last resort.
+///
+/// In the default `colors_only` mode the theme file is not touched at all:
+/// only the two `*UseLightTheme` values are written (exactly like the
+/// light/dark dropdown in Windows Settings), so wallpaper, cursors, sounds,
+/// desktop icons and the visual style keep whatever the user chose.
 fn apply_theme(theme: Theme, cfg: &Config) -> Result<&'static str, Box<dyn Error>> {
+    if cfg.apply_mode == ApplyMode::ColorsOnly {
+        write_theme_registry(theme)?;
+        broadcast_setting_change();
+        poke_shell();
+        return Ok("colors-only");
+    }
+
     let theme_file = resolve_theme_file(theme, cfg);
 
     if theme_file.exists() {
@@ -1194,6 +2332,68 @@ fn schedule(now: DateTime<Utc>, lat: f64, lon: f64) -> (Theme, DateTime<Utc>) {
     (current, next)
 }
 
+/// Fixed-time schedule: same contract as `schedule`, but the transitions come
+/// from configured local times instead of the solar calculation. Used when the
+/// user does not want to hand Windows their location.
+fn schedule_fixed(
+    now: DateTime<Utc>,
+    sunrise: NaiveTime,
+    sunset: NaiveTime,
+) -> (Theme, DateTime<Utc>) {
+    let window = fixed_transitions_window(now, sunrise, sunset);
+    let current = window
+        .iter()
+        .rev()
+        .find(|&&(t, _)| t <= now)
+        .map(|&(_, theme)| theme)
+        // The window always reaches back to the previous day's sunrise, so this
+        // fallback is unreachable in practice; dark matches "before sunrise".
+        .unwrap_or(Theme::Dark);
+    let next = window
+        .iter()
+        .find(|&&(t, _)| t > now)
+        .map(|&(t, _)| t)
+        .unwrap_or_else(|| now + chrono::Duration::hours(12));
+    (current, next)
+}
+
+/// Sunrise/sunset instants built from fixed LOCAL times for the local dates
+/// around `now`, sorted, each tagged with the theme in effect afterwards.
+fn fixed_transitions_window(
+    now: DateTime<Utc>,
+    sunrise: NaiveTime,
+    sunset: NaiveTime,
+) -> Vec<(DateTime<Utc>, Theme)> {
+    let base = now.with_timezone(&Local).date_naive();
+    let mut events = Vec::with_capacity(6);
+    for off in -1..=1 {
+        let date = base + chrono::Duration::days(off);
+        for (time, theme) in [(sunrise, Theme::Light), (sunset, Theme::Dark)] {
+            // `earliest()` handles the DST edges: a local time that does not
+            // exist on that date (spring forward) lands on the first valid
+            // instant instead of being dropped.
+            if let Some(local) = Local.from_local_datetime(&date.and_time(time)).earliest() {
+                events.push((local.with_timezone(&Utc), theme));
+            }
+        }
+    }
+    events.sort_by_key(|&(t, _)| t);
+    events
+}
+
+/// The schedule the app should follow: fixed times when configured, otherwise
+/// the solar calculation. `None` means "nothing configured yet" — the caller
+/// then asks for a location instead of pretending to have a schedule.
+fn schedule_for(cfg: &Config, now: DateTime<Utc>) -> Option<(Theme, DateTime<Utc>)> {
+    if let Some((sunrise, sunset)) = cfg.custom_times() {
+        return Some(schedule_fixed(now, sunrise, sunset));
+    }
+    if cfg.has_location() {
+        return Some(schedule(now, cfg.latitude, cfg.longitude));
+    }
+    None
+}
+
 /// Forward scan for the first transition after a polar day/night period.
 /// 200 days covers even the poles' ~6-month seasons; each probe is pure math.
 fn next_transition_beyond_window(now: DateTime<Utc>, lat: f64, lon: f64) -> DateTime<Utc> {
@@ -1252,14 +2452,18 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
     let now = Local::now();
     let now_str = now.to_rfc3339();
 
-    if !cfg.has_location() {
-        log_event(&format!("{} cause={} skipped=no-location", now_str, cause));
+    if !cfg.can_schedule() {
+        log_event(&format!("{} cause={} skipped=no-schedule", now_str, cause));
         elwt.set_control_flow(ControlFlow::Wait);
         return;
     }
 
     let now_utc = now.with_timezone(&Utc);
-    let (want, next_utc) = schedule(now_utc, cfg.latitude, cfg.longitude);
+    let Some((want, next_utc)) = schedule_for(cfg, now_utc) else {
+        log_event(&format!("{} cause={} skipped=no-schedule", now_str, cause));
+        elwt.set_control_flow(ControlFlow::Wait);
+        return;
+    };
     let current = current_theme();
     let next = next_utc.with_timezone(&Local);
 
@@ -1526,6 +2730,32 @@ fn main() {
     }
 }
 
+/// Applies the opposite of the current theme. Used by the tray item and by the
+/// settings window's "Switch now" button.
+///
+/// A deliberate manual override: it intentionally does NOT tick, touch
+/// TickState (it tracks reconciliation with the schedule, not the screen), or
+/// disturb the pending WaitUntil — so the override survives lock/unlock (see
+/// decide_tick) and resets at the next natural transition, exactly like an
+/// override made in Settings. If a failed-apply retry is pending, the toggled
+/// theme diverges from the retry baseline and the pending-retry gate stands the
+/// retry down.
+fn toggle_now(cfg: &Config) {
+    let before = current_theme();
+    let target = toggle_target(before);
+    let outcome = match apply_theme(target, cfg) {
+        Ok(method) => format!("applied={}", method),
+        Err(e) => format!("err=\"{}\"", sanitize_log_msg(&e.to_string())),
+    };
+    log_event(&format!(
+        "{} cause=toggle current={} target={} {}",
+        Local::now().to_rfc3339(),
+        theme_str(before),
+        theme_str(Some(target)),
+        outcome,
+    ));
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     ensure_com_initialized();
 
@@ -1537,13 +2767,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     // default auto_start=true must not override a broken file's false).
     let mut cfg = match load_config_at(&config_path()) {
         Ok(mut cfg) => {
-            if !cfg.has_location() {
+            set_language(cfg.language);
+            if !cfg.can_schedule() {
                 acquire_location(&mut cfg);
             }
             let _ = set_auto_start(cfg.auto_start);
             cfg
         }
         Err(e) => {
+            set_language(Language::Auto);
             report_config_error(&e);
             let mut cfg = Config::default();
             if let Some((lat, lon)) = try_get_windows_location() {
@@ -1559,22 +2791,25 @@ fn run() -> Result<(), Box<dyn Error>> {
     let _ = EVENT_PROXY.set(event_loop.create_proxy());
     start_wake_listener();
 
+    let s = strings();
     let tray_menu = Menu::new();
-    let toggle_i = MenuItem::new("Toggle Theme", true, None);
-    let open_cfg_i = MenuItem::new("Open Config", true, None);
-    let refresh_i = MenuItem::new("Refresh", true, None);
-    let quit_i = MenuItem::new("Quit", true, None);
+    let toggle_i = MenuItem::new(s.menu_toggle, true, None);
+    let settings_i = MenuItem::new(s.menu_settings, true, None);
+    let refresh_i = MenuItem::new(s.menu_refresh, true, None);
+    let open_cfg_i = MenuItem::new(s.menu_open_config, true, None);
+    let quit_i = MenuItem::new(s.menu_quit, true, None);
     tray_menu.append_items(&[
         &toggle_i,
-        &open_cfg_i,
+        &settings_i,
         &refresh_i,
         &PredefinedMenuItem::separator(),
+        &open_cfg_i,
         &quit_i,
     ])?;
 
     let mut tray_builder = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_tooltip("WinThemeSwitcher");
+        .with_tooltip(s.tray_tooltip);
     if let Some(icon) = make_tray_icon() {
         tray_builder = tray_builder.with_icon(icon);
     }
@@ -1585,11 +2820,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     }));
 
     let toggle_id = toggle_i.id().clone();
+    let settings_id = settings_i.id().clone();
     let open_cfg_id = open_cfg_i.id().clone();
     let refresh_id = refresh_i.id().clone();
     let quit_id = quit_i.id().clone();
 
     let mut state = TickState::new();
+
+    // `--settings` opens the settings window on launch (handy for shortcuts and
+    // for verifying the GUI without clicking through the tray menu).
+    if std::env::args().any(|arg| arg == "--settings") {
+        if let Some(proxy) = EVENT_PROXY.get() {
+            settings_ui::open(cfg.clone(), proxy.clone());
+        }
+    }
 
     event_loop.run(move |event, elwt| match event {
         Event::NewEvents(StartCause::Init) => tick(&cfg, elwt, TickKind::Init, "init", &mut state),
@@ -1603,39 +2847,40 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             tick(&cfg, elwt, TickKind::Wake, cause, &mut state);
         }
+        Event::UserEvent(AppEvent::ToggleTheme) => toggle_now(&cfg),
+        Event::UserEvent(AppEvent::ConfigChanged(new_cfg)) => {
+            // The settings window already persisted the file; adopt it, make
+            // the language/tray labels follow and recalc the schedule.
+            cfg = *new_cfg;
+            set_language(cfg.language);
+            let s = strings();
+            toggle_i.set_text(s.menu_toggle);
+            settings_i.set_text(s.menu_settings);
+            refresh_i.set_text(s.menu_refresh);
+            open_cfg_i.set_text(s.menu_open_config);
+            quit_i.set_text(s.menu_quit);
+            let _ = set_auto_start(cfg.auto_start);
+            tick(&cfg, elwt, TickKind::Refresh, "settings-saved", &mut state);
+        }
         Event::UserEvent(AppEvent::Menu(id)) => {
             if id == quit_id {
                 elwt.exit();
+            } else if id == settings_id {
+                // EventLoopProxy is stored in EVENT_PROXY; ActiveEventLoop has
+                // no create_proxy of its own.
+                if let Some(proxy) = EVENT_PROXY.get() {
+                    settings_ui::open(cfg.clone(), proxy.clone());
+                }
             } else if id == open_cfg_id {
                 open_config_in_editor();
             } else if id == toggle_id {
-                // A deliberate manual override: applies the opposite theme
-                // and intentionally does NOT tick, touch TickState (it
-                // tracks reconciliation with the schedule, not the screen),
-                // or disturb the pending WaitUntil — so the override
-                // survives lock/unlock (see decide_tick) and resets at the
-                // next natural transition, exactly like an override made in
-                // Settings. If a failed-apply retry is pending, the toggled
-                // theme diverges from the retry baseline and the
-                // pending-retry gate stands the retry down.
-                let before = current_theme();
-                let target = toggle_target(before);
-                let outcome = match apply_theme(target, &cfg) {
-                    Ok(method) => format!("applied={}", method),
-                    Err(e) => format!("err=\"{}\"", sanitize_log_msg(&e.to_string())),
-                };
-                log_event(&format!(
-                    "{} cause=toggle current={} target={} {}",
-                    Local::now().to_rfc3339(),
-                    theme_str(before),
-                    theme_str(Some(target)),
-                    outcome,
-                ));
+                toggle_now(&cfg);
             } else if id == refresh_id {
                 match load_config_at(&config_path()) {
                     Ok(new_cfg) => {
                         cfg = new_cfg;
-                        if !cfg.has_location() {
+                        set_language(cfg.language);
+                        if !cfg.can_schedule() {
                             if let Some((lat, lon)) = try_get_windows_location() {
                                 cfg.latitude = lat;
                                 cfg.longitude = lon;
@@ -2301,5 +3546,170 @@ mod tests {
         let cfg = Config::default();
         assert!(resolve_theme_file(Theme::Light, &cfg).ends_with("aero.theme"));
         assert!(resolve_theme_file(Theme::Dark, &cfg).ends_with("dark.theme"));
+    }
+
+    // --- colours-only mode, fixed times, language (v0.5.0) ---
+
+    #[test]
+    fn config_defaults_are_colours_only_with_auto_language() {
+        let cfg = Config::default();
+        assert_eq!(cfg.apply_mode, ApplyMode::ColorsOnly);
+        assert_eq!(cfg.language, Language::Auto);
+        assert!(cfg.custom_sunrise.is_none() && cfg.custom_sunset.is_none());
+        assert!(
+            !cfg.can_schedule(),
+            "no fixed times and no location means there is nothing to schedule"
+        );
+    }
+
+    #[test]
+    fn parse_hhmm_accepts_valid_times_and_rejects_the_rest() {
+        assert_eq!(parse_hhmm("07:30"), NaiveTime::from_hms_opt(7, 30, 0));
+        assert_eq!(parse_hhmm(" 7:05 "), NaiveTime::from_hms_opt(7, 5, 0));
+        assert_eq!(parse_hhmm("23:59"), NaiveTime::from_hms_opt(23, 59, 0));
+        assert_eq!(parse_hhmm("00:00"), NaiveTime::from_hms_opt(0, 0, 0));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("12:60"), None);
+        assert_eq!(parse_hhmm("-1:00"), None);
+        assert_eq!(parse_hhmm("noon"), None);
+        assert_eq!(parse_hhmm(""), None);
+    }
+
+    #[test]
+    fn format_hhmm_round_trips() {
+        for text in ["00:00", "07:05", "23:59"] {
+            let time = parse_hhmm(text).expect("valid time");
+            assert_eq!(format_hhmm(time), text);
+        }
+    }
+
+    #[test]
+    fn fixed_times_schedule_without_a_location() {
+        let cfg = Config {
+            custom_sunrise: Some("06:30".into()),
+            custom_sunset: Some("18:00".into()),
+            ..Config::default()
+        };
+        assert!(!cfg.has_location());
+        assert!(cfg.can_schedule());
+        assert_eq!(
+            cfg.custom_times(),
+            Some((
+                NaiveTime::from_hms_opt(6, 30, 0).unwrap(),
+                NaiveTime::from_hms_opt(18, 0, 0).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_single_invalid_time_disables_the_fixed_schedule() {
+        let cfg = Config {
+            custom_sunrise: Some("06:30".into()),
+            custom_sunset: Some("later".into()),
+            ..Config::default()
+        };
+        assert_eq!(cfg.custom_times(), None);
+        assert!(!cfg.can_schedule());
+    }
+
+    #[test]
+    fn fixed_schedule_follows_the_configured_times() {
+        let sunrise = NaiveTime::from_hms_opt(6, 30, 0).unwrap();
+        let sunset = NaiveTime::from_hms_opt(18, 0, 0).unwrap();
+        let today = Local::now().date_naive();
+        // Built from local wall-clock times so the test passes in any timezone.
+        for (hour, minute, expected) in [
+            (7u32, 0u32, Theme::Light),
+            (12, 0, Theme::Light),
+            (19, 0, Theme::Dark),
+            (5, 0, Theme::Dark),
+        ] {
+            let local = Local
+                .from_local_datetime(&today.and_hms_opt(hour, minute, 0).unwrap())
+                .earliest()
+                .expect("valid local time");
+            let now = local.with_timezone(&Utc);
+            let (theme, next) = schedule_fixed(now, sunrise, sunset);
+            assert_eq!(theme, expected, "at local {hour:02}:{minute:02}");
+            assert!(next > now, "next transition must be in the future");
+            assert!(
+                next - now < chrono::Duration::hours(24),
+                "next transition must be within a day"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_times_win_over_a_configured_location() {
+        let sunrise = NaiveTime::from_hms_opt(6, 30, 0).unwrap();
+        let sunset = NaiveTime::from_hms_opt(18, 0, 0).unwrap();
+        let cfg = Config {
+            latitude: RIYADH.0,
+            longitude: RIYADH.1,
+            custom_sunrise: Some("06:30".into()),
+            custom_sunset: Some("18:00".into()),
+            ..Config::default()
+        };
+        let now = utc(2026, 3, 20, 12, 0, 0);
+        assert_eq!(
+            schedule_for(&cfg, now),
+            Some(schedule_fixed(now, sunrise, sunset))
+        );
+    }
+
+    #[test]
+    fn schedule_for_is_none_without_times_or_location() {
+        assert_eq!(
+            schedule_for(&Config::default(), utc(2026, 3, 20, 12, 0, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn config_round_trips_the_new_fields() {
+        let t = TempConfig::new(
+            "new-fields",
+            Some(
+                r#"{
+                    "latitude": 24.7,
+                    "longitude": 46.7,
+                    "apply_mode": "full_theme",
+                    "custom_sunrise": "05:45",
+                    "custom_sunset": "19:15",
+                    "language": "zh-CN"
+                }"#,
+            ),
+        );
+        let cfg = load_config_at(&t.0).expect("must parse");
+        assert_eq!(cfg.apply_mode, ApplyMode::FullTheme);
+        assert_eq!(cfg.custom_sunrise.as_deref(), Some("05:45"));
+        assert_eq!(cfg.custom_sunset.as_deref(), Some("19:15"));
+        assert_eq!(cfg.language, Language::Chinese);
+        assert!(cfg.can_schedule());
+    }
+
+    #[test]
+    fn config_from_before_this_release_still_loads() {
+        // Backwards compatibility: a pre-0.5.0 file has none of the new keys.
+        let t = TempConfig::new(
+            "old-file",
+            Some(r#"{"latitude": 24.7, "longitude": 46.7, "auto_start": false}"#),
+        );
+        let cfg = load_config_at(&t.0).expect("must parse");
+        assert_eq!(cfg.apply_mode, ApplyMode::ColorsOnly);
+        assert_eq!(cfg.language, Language::Auto);
+        assert!(!cfg.auto_start);
+        assert!(cfg.has_location());
+    }
+
+    #[test]
+    fn config_accepts_the_documented_string_values() {
+        let language = |value: &Language| serde_json::to_string(value).unwrap();
+        assert_eq!(language(&Language::Auto), "\"auto\"");
+        assert_eq!(language(&Language::English), "\"en-US\"");
+        assert_eq!(language(&Language::Chinese), "\"zh-CN\"");
+        let mode = |value: &ApplyMode| serde_json::to_string(value).unwrap();
+        assert_eq!(mode(&ApplyMode::ColorsOnly), "\"colors_only\"");
+        assert_eq!(mode(&ApplyMode::FullTheme), "\"full_theme\"");
     }
 }

@@ -34,6 +34,9 @@ Start-Process "C:\Tools\WinThemeSwitcher\win-theme-switcher.exe"
 
 **Resolved as of the IThemeManager2 + code-signing migration** — both root causes of the AV friction were addressed simultaneously. The signed binary (`CN=WinThemeSwitcher Self-Signed` cert trusted via `Cert:\CurrentUser\Root`) collapses the Authenticode-trust signal, and tier-1 theme apply via `IThemeManager2::SetCurrentTheme` removes the `HWND_BROADCAST WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` signals that previously tripped behavior heuristics. **Sign every release build** (see Build section below) — unsigned builds will resurrect the issue. Everything below is preserved as historical context for unsigned-build scenarios; the current signed build should not need any of it.
 
+**Settings GUI + manifest (2026-09-24):** `app.manifest` is embedded by `build.rs` through `cargo:rustc-link-arg` (`/MANIFEST:EMBED` + `/MANIFESTUAC:NO` + `/MANIFESTINPUT:<abs path>`) — rustc does not pass `/MANIFEST:EMBED` itself, and without the manifest the settings window's controls fall back to the classic (unthemed) look and the process is not DPI aware. The window (`mod settings_ui`) runs on its own thread with its own message loop so the winit loop keeps scheduling; it hands the saved config back through `AppEvent::ConfigChanged`. Rebuild it after touching `app.manifest`.
+
+**Switching modes (2026-09-24):** `Config::apply_mode` defaults to `colors_only`, which calls only `write_theme_registry` + `broadcast_setting_change` + `poke_shell` — the same thing Windows Settings does for light/dark, and it leaves wallpaper/cursors/sounds/icons/visual style alone. `full_theme` keeps the old three-tier `.theme` apply. Fixed times (`custom_sunrise`/`custom_sunset`, `"HH:MM"`) take precedence over the solar schedule and make a location unnecessary; `Config::can_schedule()` and `schedule_for()` are the single entry points for that decision. UI strings live in `Strings` (EN/ZH) with the language held in an atomic so it can change at runtime.
 **Dev/test builds (2026-08-03):** KSN flagged fresh unsigned *test* binaries in `target\debug\deps\` (`VHO:Trojan.Win32.Convagent.gen`) — the trust rules above are path-based and don't cover them, and KSN's scanner locks each fresh exe faster than a post-build signtool can run. Two-layer fix now in place: (1) a Kaspersky **exclusion on the whole `target\` folder** (Settings → Security settings → Threats and Exclusions → Manage exclusions), added by the user; (2) `scripts\test.ps1` builds the test binary, signs it from the cert store, and only then executes it — **run tests via this script, not bare `cargo test`**, so the first execution KSN ever sees carries a valid signature.
 
 ### Historical: pre-signing trust setup
@@ -114,7 +117,7 @@ This collapses the Kaspersky heuristic signal — signed builds pass without tri
 
 ## Architecture — `src/main.rs`
 
-Single file, 2305 lines (incl. `mod tests`), event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
+Single file, ~3490 lines (incl. `mod settings_ui` and `mod tests`), event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
 
 ### 1. Theme apply — three-tier fallback in `apply_theme`
 

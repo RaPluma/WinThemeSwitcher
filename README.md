@@ -30,21 +30,27 @@ On first launch the app reads your coordinates via Windows Location. If Location
 `config.json` lives next to the exe (deliberately, so the app works from wherever you put it).
 
 ```json
-{
   "latitude": 40.7128,
   "longitude": -74.0060,
   "auto_start": true,
+  "apply_mode": "colors_only",
+  "custom_sunrise": null,
+  "custom_sunset": null,
   "theme_day": null,
-  "theme_night": null
+  "theme_night": null,
+  "language": "auto"
 }
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
-| `latitude` / `longitude` | from Windows Location, else `0.0` | Decimal degrees. `0.0, 0.0` triggers the first-run location flow. |
+| `latitude` / `longitude` | from Windows Location, else `0.0` | Decimal degrees. `0.0, 0.0` means "not set". Only used when no fixed times are configured. |
 | `auto_start` | `true` | When `true`, registers `HKCU\...\Run\WinThemeSwitcher`; when `false`, removes the entry. Applied on every launch and on Refresh. |
-| `theme_day` | `null` → `%SystemRoot%\Resources\Themes\aero.theme` | Path to the `.theme` applied after sunrise. |
-| `theme_night` | `null` → `%SystemRoot%\Resources\Themes\dark.theme` | Path to the `.theme` applied after sunset. |
+| `apply_mode` | `"colors_only"` | `colors_only` flips only the light/dark colours (exactly like the light/dark dropdown in Windows Settings) and leaves wallpaper, cursors, sounds, desktop icons and the visual style untouched. `full_theme` applies the whole `.theme` file instead, which also changes wallpaper/cursors/sounds — see [Switching modes](#switching-modes). |
+| `custom_sunrise` / `custom_sunset` | `null` | Fixed local switch times as `"HH:MM"` (24h). When **both** are set they replace the solar calculation entirely and no location is needed — Windows never asks for the location permission. |
+| `theme_day` | `null` → `%SystemRoot%\Resources\Themes\aero.theme` | Path to the `.theme` applied after sunrise (only used with `apply_mode: "full_theme"`). |
+| `theme_night` | `null` → `%SystemRoot%\Resources\Themes\dark.theme` | Path to the `.theme` applied after sunset (only used with `apply_mode: "full_theme"`). |
+| `language` | `"auto"` | UI language: `auto` (follow the Windows UI language), `en-US` or `zh-CN`. |
 
 Custom `.theme` paths must use double backslashes in JSON: `"C:\\Users\\you\\AppData\\Local\\Microsoft\\Windows\\Themes\\Custom.theme"`. They also need to be already registered with Windows (i.e. installed once via Settings → Personalization → Themes) for the primary apply path to find them.
 
@@ -53,9 +59,33 @@ After editing config, right-click tray → **Refresh**. No restart needed.
 ## Tray menu
 
 - **Toggle Theme** — flips light/dark right now, as a manual override: it sticks (including across lock/unlock and sleep) until the next natural sunrise/sunset transition.
-- **Open Config** — opens `config.json` in your default editor.
+- **Settings…** — opens the native settings window (see below).
 - **Refresh** — re-reads config, retries Windows Location if needed, force-applies the correct theme.
+- **Open Config** — opens `config.json` in your default editor, for the fields the window does not expose.
 - **Quit** — exits. The auto-start entry persists; set `auto_start: false` and click Refresh (or relaunch) once to remove it.
+
+## Settings window
+
+`Settings…` (or launching the exe with `--settings`) opens a native Win32 window using the Common Controls v6 theme, so it looks like a system dialog and follows the light/dark state:
+
+- **Mode** — only switch light/dark, or apply the whole `.theme` file.
+- **Sunrise / Sunset** — fixed `HH:MM` times; leave both empty to use the location below.
+- **Latitude / Longitude** + **Use current location** — only needed when no fixed times are set.
+- **Start automatically at login**, **Language**.
+- **Save and apply** writes `config.json`, recalculates the schedule and applies the right theme immediately; **Switch now** toggles right away; **Open config file** / **Open log** open them in the default editor.
+
+## Switching modes
+
+Windows has no "switch only the colour mode" API: what Settings does for light/dark is write two registry values (`AppsUseLightTheme`, `SystemUsesLightTheme`) and broadcast `ImmersiveColorSet`. A `.theme` file, by contrast, is a bundle — it carries the light/dark mode *and* the wallpaper, the cursor scheme, the sounds, the desktop icons and the visual style, all in one file:
+
+```ini
+[Control Panel\\Cursors]   Arrow=%SystemRoot%\\cursors\\aero_arrow.cur   ; your cursor scheme would be replaced
+[Control Panel\\Desktop]   Wallpaper=%SystemRoot%\\web\\wallpaper\\Windows\\img0.jpg
+[VisualStyles]             SystemMode=Light / AppMode=Light            ; the actual light/dark switch
+```
+
+- `apply_mode: "colors_only"` (default) writes only the two registry values, so nothing but the colours changes.
+- `apply_mode: "full_theme"` applies the `.theme` through IThemeManager2 (falling back to `ShellExecuteW(.theme)`, then the registry) — the pre-0.4.1 behaviour, which also swaps wallpaper/cursors/sounds/icons.
 
 If two copies are launched, the second shows a notice and exits (single-instance). Fatal startup errors show a dialog and are recorded in `events.log`, as are panics.
 
@@ -132,7 +162,7 @@ Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **mi
 |---|---|---|
 | **v0.3.2** | patch | **Shipped 2026-07-04.** Sunrise/sunset day-bracketing fix + scheduling tests + CI gate; `config.json` never overwritten on a parse error (error is logged + shown in a non-blocking dialog, empty file self-heals, autostart setting survives a broken file) |
 | **v0.4.0** | minor | **Shipped 2026-09-01.** Preserve manual overrides across lock/unlock/resume (time-based reconciliation — overrides survive any-length sleeps; missed transitions still reconcile); "Toggle Theme" tray item; fail-loudly bundle (panic hook, fatal-error MessageBox, wake-listener logging + WTS registration retry, single-instance mutex, bounded apply retry with user-intervention stand-down); `.theme`-name resolution + tick-decision unit tests (40 total); **`scripts\test.ps1` + new `scripts\build.ps1`** (signed test binary; signed release exe with **RFC 3161 DigiCert countersignature** before first execution — closes the KSN `VHO:Trojan.Win32.Convagent.gen` first-seen flag vector); **CLAUDE.md agent-facing rule** to keep LLM coding agents on the signing wrappers (the root cause of this release slipping six weeks past v0.3.2 was bare `cargo build` producing unsigned exes that KSN locked on first execute) |
-| **v0.4.1** | patch | **TBD — current state is clean (40/40 tests, 0 warnings). Slot reserved for the next audit.** If nothing surfaces, this row stays at "did not ship" — the table allows patch releases to slot in anywhere. |
+| **v0.4.1** | patch | **Shipped 2026-09-24.** Colours-only switching by default (`apply_mode: "colors_only"` — wallpaper/cursors/sounds/icons/visual style stay put), fixed `custom_sunrise`/`custom_sunset` times (no location permission needed), English/Simplified-Chinese UI (`language`), and a native Win32 settings window (tray → Settings… or `--settings`). Manifest now embedded via `build.rs` (Common Controls v6 + PerMonitorV2). 51 unit tests. |
 | **v0.5.0** | minor | **Automate the release pipeline.** `scripts\release.ps1` wraps `build.ps1` + `gh release upload --clobber` + `gh release edit --prerelease=false`; `release.yml` either calls the wrapper on a self-hosted runner or stops generating assets; a verify step (re-check `Get-AuthenticodeSignature` + countersignature post-upload) gates the upload. **First non-prerelease release** since v0.2.0 — fixes `/releases/latest` and unblocks winget automation. Also: investigate the recurring `wake_listener_err stage=power_register code=87` and either fix it (different `DEVICE_NOTIFY_*` flag? explicit unregister-before-register?) or add a CLAUDE.md note that it's benign. Candidate point to launch the personal Scoop bucket (`persist` mechanism fits the exe-relative config model better than winget's symlink layout — see §Release & distribution §4). |
 | **v0.6.0** | minor | SignPath Foundation CA signing in CI (ends the manual signed-asset swap); submit the first CA-signed binary to Microsoft Defender + Kaspersky for reputation seeding. **Removes the §Antivirus false positives section from README** — Kaspersky heuristics no longer fire on first sight for CA-signed binaries, so the user-facing allowlist flow becomes historical. Also unlocks the winget submission (§Release & distribution §3) — winget's validation pipeline runs its own AV scans, and a CA-signed + Defender-submitted binary is what gets through. |
 | **v0.7.0** | minor | Live tray tooltip ("Dark until 06:12", "Location needed — click Refresh", or a degraded-apply warning); "Open Log" menu item; MessageBox when a user-initiated Refresh fails (scheduled ticks stay silent-to-log); first-run location retry without requiring Refresh; `offset_sunrise_min` / `offset_sunset_min` config fields (sun-anchored, so still compatible with "no custom times") |
